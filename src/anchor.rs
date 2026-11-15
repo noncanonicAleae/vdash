@@ -27,6 +27,7 @@ pub struct AmendmentEntry {
 pub struct Anchor {
     pub version: u32,
     pub campaign_id: String,
+    #[serde(default)]
     pub campaign_path: String,
     pub baseline_commit: String,
     pub manifest: BTreeMap<String, String>,
@@ -162,13 +163,6 @@ pub fn verify(ctx: &Ctx) -> Vec<String> {
         problems.push(format!(
             "campaign_id differs: anchor has '{}', config has '{}'",
             anc.campaign_id, ctx.cfg.id
-        ));
-    }
-    let expected_camp_path = canonical_str(&ctx.campaign.root);
-    if anc.campaign_path != expected_camp_path {
-        problems.push(format!(
-            "campaign_path differs: anchor has '{}', current is '{}'",
-            anc.campaign_path, expected_camp_path
         ));
     }
 
@@ -356,11 +350,22 @@ mod tests {
         fs::write(&impl_held, &orig_impl).unwrap();
         assert!(verify(&ctx).is_empty());
 
-        // 6. campaign_path differs
-        let mut bad_ctx = ctx.clone();
-        bad_ctx.campaign = paths::Campaign::new(tmp.path().join("different_path"));
-        let probs = verify(&bad_ctx);
-        assert!(probs.iter().any(|p| p.contains("campaign_path")));
+        // 6. Moving the campaign directory still verifies cleanly, while campaign_id mismatch fails
+        let moved_dir = tmp.path().join("moved_camp");
+        fs::rename(&ctx.campaign.root, &moved_dir).unwrap();
+        let mut moved_ctx = ctx.clone();
+        moved_ctx.campaign = paths::Campaign::new(&moved_dir);
+        assert!(
+            verify(&moved_ctx).is_empty(),
+            "expected clean verify after moving campaign, got {:?}",
+            verify(&moved_ctx)
+        );
+        fs::rename(&moved_dir, &ctx.campaign.root).unwrap();
+
+        let mut wrong_id_ctx = ctx.clone();
+        wrong_id_ctx.cfg.id = "different_id".to_string();
+        let probs = verify(&wrong_id_ctx);
+        assert!(probs.iter().any(|p| p.contains("campaign_id")));
 
         // 7. extend with amendment record, then tamper with amendment record
         let rec_rel = "amendments/001-fix.md";

@@ -419,6 +419,7 @@ keys are campaign-relative (`lean/Apc/...`) for both.
  "amendments": [{"n": 1, "record": "amendments/001-x.md", "record_sha256": "...",
                  "manifest_hash_after": "...", "approved_by": "user", "at": "<iso8601>"}]}
 ```
+`campaign_path` records where the anchor was created (informational; not checked on verify, so campaigns can be moved).
 `manifest_hash` = sha256 of the concatenation of `"<relpath>\0<sha256>\n"` over the
 manifest sorted by relpath. The trusted set is `lean/Apc/Challenge.lean` plus every
 `*.lean` under `lean/Apc/Spec/`.
@@ -741,8 +742,9 @@ agent and between stages), acts, and moves each to `inbox/done/`.
   - `create(ctx, baseline_commit)`: refuses to overwrite an existing anchor (code 2;
     the user must delete it deliberately).
   - `verify(ctx) -> Vec<String>`: empty when `.heldout/` matches. Problems reported:
-    anchor missing; a file added, removed or changed in `.heldout/`; `campaign_path`
-    differs; an amendment record missing or with a different sha256.
+    anchor missing; `campaign_id` differs; a file added, removed or changed in
+    `.heldout/`; an amendment record missing or with a different sha256 (`campaign_path`
+    is informational and is not checked, so moving a campaign directory stays valid).
   - `extend(ctx, n, record, approved_by)`: recompute the manifest from `.heldout/`,
     append the amendment entry.
   - Tests: create then verify is clean; each kind of tampering is reported; overwrite
@@ -1556,3 +1558,5 @@ Gemini owns M8-03..M8-06.
   and the worker, falsifier, integrator and spec-writer skills and the denied-turn
   retry now say file changes go only through the edit and write tools. Also added
   `vdash kill` / `/kill` and `/verbose [on|off]`.
+- 2026-11-15 (Gemini): dropped the `campaign_path` check in `anchor::verify` (M1-08,
+  §3.2) so campaigns can be moved between directories without invalidating the anchor.
