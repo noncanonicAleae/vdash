@@ -113,6 +113,13 @@ M4 interactive app · M5 spec phase · M6 amendments · M7 later · status log.
 - C11. `WebSearch` and `WebFetch` (with `--tools` listing them and `--allowedTools
   WebSearch WebFetch`) work headless on the subscription; `WebFetch` on
   `https://loogle.lean-lang.org/json?q=Finset.sum_nonneg` returned the hit list.
+- C13. (probed 2026-11-15, `haiku`, flags as `Profile::Lean`) With allow rules
+  `Bash(cat *)`, `Bash(head *)`, `Bash(sed -n *)`, `Bash(ls *)`, `Bash(grep *)`:
+  `cat f`, `head -2 f`, `sed -n 2p f`, `cd sub && cat f` and `cat f | grep x` run;
+  `cat > f <<EOF`, `cat f > g` and `sed -n 1p f; touch g` are denied. But
+  `sed -n 'w g' f` is **allowed** (a write through a read rule), so no `sed` rule.
+  In a live campaign 11 of 18 worker denials were heredoc writes, the rest
+  `cd …; cat …` reads.
 - C12. (2026-11-14) On the Pro subscription, `--model` accepts `claude-opus-5-5`,
   `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-2` and the aliases `opus`,
   `sonnet`, `haiku`, `fable` (`fable` resolved to `claude-fable-5-2`). A one-word reply
@@ -1543,3 +1550,9 @@ Gemini owns M8-03..M8-06.
   Live exit test M8-02 passed: `vdash prove --single --rounds 1` on `isort` with
   `worker = gemini:gemini-4-argon-high` accepted 4/4 targets in round 1 with zero
   `denied tool calls`. Installed `target/release/vdash` to `~/.local/bin/vdash`.
+- 2026-11-15 (Claude): denied tool calls. Claude workers lost turns to shell writes
+  (heredocs, `sed -i`) and shell reads (`cd …; cat …`). Added read-only
+  `cat`/`head`/`tail`/`ls`/`wc` allow rules for Claude (fact C13; no `sed`/`find`),
+  and the worker, falsifier, integrator and spec-writer skills and the denied-turn
+  retry now say file changes go only through the edit and write tools. Also added
+  `vdash kill` / `/kill` and `/verbose [on|off]`.

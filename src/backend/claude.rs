@@ -11,7 +11,22 @@ use crate::paths::Ctx;
 use crate::proc;
 
 /// Search permissions every tool-using role gets.
-const SEARCH_RULES: [&str; 5] = ["Bash(vdash search *)", "Bash(grep *)", "Bash(rg *)", "WebSearch", "WebFetch"];
+/// Read-only shell rules for every tool-using profile. Plain reads keep agents from
+/// burning turns on denied `cd …; cat …` (fact C13). `sed` and `find` are left out:
+/// `sed -n 'w f'` and `find -delete` write through an allow rule. Redirections and
+/// heredocs stay denied even with `Bash(cat *)` (C13).
+const SEARCH_RULES: [&str; 10] = [
+    "Bash(vdash search *)",
+    "Bash(grep *)",
+    "Bash(rg *)",
+    "Bash(cat *)",
+    "Bash(head *)",
+    "Bash(tail *)",
+    "Bash(ls *)",
+    "Bash(wc *)",
+    "WebSearch",
+    "WebFetch",
+];
 
 pub struct ClaudeCli {
     pub command: Vec<String>,
@@ -221,7 +236,8 @@ mod tests {
         assert!(a.contains(&"dontAsk".to_string()));
         call.profile = Profile::Readonly;
         let a = ClaudeCli::args(&call);
-        assert!(a.contains(&"Bash(vdash search *)".to_string()));
+        assert!(a.contains(&"Bash(vdash search *)".to_string()) && a.contains(&"Bash(cat *)".to_string()));
+        assert!(!a.iter().any(|r| r.starts_with("Bash(sed") || r.starts_with("Bash(find")));
         assert!(!a.contains(&"Bash(vdash check *)".to_string()) && !a.contains(&"Edit".to_string()));
     }
 }

@@ -153,7 +153,7 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
             errs.insert(
                 0,
                 format!(
-                    "your previous turn was cut short because a tool call was denied ({}). Use only the commands your role lists (`vdash check`, `vdash axioms`, `vdash search`, `grep`), each as a single plain command with no pipes, `cd` or `&&`; if one is refused again, stop using the shell: the engine checks your file after you reply",
+                    "your previous turn was cut short because a tool call was denied ({}). Change files only with your edit and write tools, never through the shell (no `cat > f`, heredocs, `>`, `sed -i`, `cp`, `python3`). Use only the commands your role lists (`vdash check`, `vdash axioms`, `vdash search`, and `cat`, `head`, `tail`, `ls`, `wc`, `grep` for reading); if one is refused again, stop using the shell: the engine checks your file after you reply",
                     result.denials.join(", ")
                 ),
             );

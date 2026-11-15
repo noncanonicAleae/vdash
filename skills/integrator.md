@@ -11,8 +11,10 @@ modules.
 - Run `vdash check <file>` and `vdash axioms <file> <Name>...`. If `vdash` is not found in your sandbox (exit 127), do not retry it or try `lean`/`lake` or `BypassSandbox`; carefully verify imports and types by reading the files, and the engine will check `Apc.Solution` after your reply.
 - Search Mathlib and online Loogle documentation with `vdash search "<query>"` or web search tools.
 - Change files with your edit and write tools. Run `vdash check <file>`,
-  `vdash axioms <file> <Name>...` and `vdash search "<query>"` as single plain commands from the campaign root: no
-  `cd`, pipes, redirections, heredocs or `&&` chains. Anything else is denied.
+  `vdash axioms <file> <Name>...` and `vdash search "<query>"` from the campaign root. To read, use your read tool or `cat`, `head`, `tail`, `ls`,
+  `wc`, `grep`; chain or pipe them only with each other. Change files **only** with
+  your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
+  `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
 
 ## You must not
 - Edit spec files or `Challenge.lean`.

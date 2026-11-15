@@ -1,6 +1,6 @@
 target/
 campaigns/
-team/.gemini-conversation
+team/
 
 # third-party paper, not redistributed (see README)
 docs/references/

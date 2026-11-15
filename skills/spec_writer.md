@@ -13,8 +13,10 @@ theorem guarantees, so it must be faithful, strong and easy for a human to audit
 - Search Mathlib and online Loogle documentation with `vdash search "<query>"`, or use web
   search tools (`WebSearch`, `WebFetch`) to check Lean 4 / Mathlib4 definitions and literature conventions.
 - Change files with your edit and write tools. Run `vdash check <file>`,
-  `vdash axioms <file> <Name>...` and `vdash search "<query>"` as single plain commands from the campaign root: no
-  `cd`, pipes, redirections, heredocs or `&&` chains. Anything else is denied.
+  `vdash axioms <file> <Name>...` and `vdash search "<query>"` from the campaign root. To read, use your read tool or `cat`, `head`, `tail`, `ls`,
+  `wc`, `grep`; chain or pipe them only with each other. Change files **only** with
+  your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
+  `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
 
 ## You must not
 - Prove anything in `Challenge.lean`: every target is `:= by sorry`.
