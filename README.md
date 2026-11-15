@@ -166,7 +166,7 @@ Run `vdash` with no subcommand inside a campaign to open the terminal UI.
 | `/prove [single]` | Start the proof engine in the background (`single` runs one worker without leads) |
 | `/pause`, `/resume`, `/stop` | Pause, resume, or cleanly stop a running proof engine |
 | `/kill` | Kill the engine and every agent subprocess immediately, for good (see below) |
-| `/verbose` | Toggle live display of the Lean lines agents add to the proof files as they write them |
+| `/verbose [on\|off]` | Toggle (or set) live display of the Lean lines agents add to the proof files as they write them |
 | `/gate` | Run the deterministic gatekeeper immediately |
 | `/tcb` | Display the Trusted Computing Base (every target's transitive definition closure) |
 | `/amend` | List proposed specification amendments and their Critic verdicts |
@@ -184,7 +184,7 @@ Run `vdash` with no subcommand inside a campaign to open the terminal UI.
 `/stop` is cooperative: the engine finishes the agent it is waiting on, reverts out-of-scope edits and exits. `/kill` (`vdash kill`) is for when you want everything gone now. It sends SIGTERM to the engine and to every process it started (the `claude` / `agy` calls and their children), waits up to 8 seconds, then SIGKILLs whatever is left. A round killed midway is not reverted on the spot; the next engine start snapshots the tree again, and the gatekeeper never trusts agent edits regardless.
 
 #### `/verbose`
-Agents edit Lean files in place, so by default you only see their summaries. With `/verbose` on, the transcript also shows each new line that appears in `lean/Apc/Proof/**`, the proof work directory and `Solution.lean` (at most 14 lines per file per update). Turn it off with `/verbose` again.
+Agents edit Lean files in place, so by default you only see their summaries. With `/verbose` on, the transcript also shows each new line that appears in `lean/Apc/Proof/**`, the proof work directory and `Solution.lean` (at most 14 lines per file per update). Turn it off with `/verbose off` (or `/verbose` again).
 
 ### Keyboard Shortcuts
 - **`Enter`**: Send command or plain-text message (or accept selected completion).

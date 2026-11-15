@@ -730,14 +730,21 @@ impl Session {
                 Ok(s) => self.app.say(Kind::Warn, "vdash", s),
                 Err(e) => self.app.say(Kind::Warn, "vdash", e.message),
             },
-            Cmd::Verbose => {
-                if self.verbose.take().is_some() {
-                    self.app.say(Kind::Info, "vdash", "verbose off");
-                } else {
-                    let mut w = watch::ProofWatch::default();
-                    w.poll(&self.ctx); // baseline: only later changes are shown
-                    self.verbose = Some(w);
-                    self.app.say(Kind::Info, "vdash", "verbose on: new Lean lines in the proof files show here as agents write them");
+            Cmd::Verbose(want) => {
+                let on = self.verbose.is_some();
+                match want.unwrap_or(!on) {
+                    false if on => {
+                        self.verbose = None;
+                        self.app.say(Kind::Info, "vdash", "verbose off");
+                    }
+                    false => self.app.say(Kind::Info, "vdash", "verbose is already off"),
+                    true if on => self.app.say(Kind::Info, "vdash", "verbose is already on (/verbose off to stop)"),
+                    true => {
+                        let mut w = watch::ProofWatch::default();
+                        w.poll(&self.ctx); // baseline: only later changes are shown
+                        self.verbose = Some(w);
+                        self.app.say(Kind::Info, "vdash", "verbose on: new Lean lines in the proof files show here as agents write them (/verbose off to stop)");
+                    }
                 }
             }
             Cmd::Gate => {
@@ -1068,6 +1075,12 @@ mod tests {
         std::fs::write(proof.join("A.lean"), "theorem a : True := by\n  trivial\ntheorem b : 1 = 1 := by\n  rfl\n").unwrap();
         s.pump();
         assert!(s.app.transcript.iter().any(|l| l.text.contains("theorem b")));
+        s.exec("/verbose on".into());
+        assert!(s.verbose.is_some());
+        s.exec("/verbose off".into());
+        assert!(s.verbose.is_none());
+        s.exec("/verbose".into());
+        assert!(s.verbose.is_some());
         s.exec("/verbose".into());
         assert!(s.verbose.is_none());
     }

@@ -24,7 +24,7 @@ pub enum Cmd {
     Resume,
     Stop,
     Kill,
-    Verbose,
+    Verbose(Option<bool>),
     Gate,
     Tcb,
     Amend(Option<(bool, u32)>),
@@ -55,7 +55,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("resume", "", "resume a paused engine"),
     ("stop", "", "stop the engine, or end the spec loop (good enough)"),
     ("kill", "", "kill the engine and all agent processes now, for good"),
-    ("verbose", "", "toggle showing proofs as agents write them"),
+    ("verbose", "[on|off]", "toggle (or set) showing proofs as agents write them"),
     ("gate", "", "run the gatekeeper now"),
     ("tcb", "", "show what a reader must trust"),
     ("amend", "[approve N | reject N | propose <file>]", "list, decide or propose spec amendments"),
@@ -220,7 +220,12 @@ pub fn parse(line: &str) -> Result<Input, String> {
         "resume" => none(Cmd::Resume),
         "stop" => none(Cmd::Stop),
         "kill" => none(Cmd::Kill),
-        "verbose" => none(Cmd::Verbose),
+        "verbose" => match words.as_slice() {
+            [] => Ok(Cmd::Verbose(None)),
+            ["on"] => Ok(Cmd::Verbose(Some(true))),
+            ["off"] => Ok(Cmd::Verbose(Some(false))),
+            _ => Err(usage("verbose")),
+        },
         "gate" => none(Cmd::Gate),
         "tcb" => none(Cmd::Tcb),
         "amend" | "amendments" => match words.as_slice() {
@@ -326,7 +331,7 @@ mod tests {
         assert_eq!(parse("/amend approve 3").unwrap(), Input::Cmd(Cmd::Amend(Some((true, 3)))));
         assert_eq!(parse("/amend reject 12").unwrap(), Input::Cmd(Cmd::Amend(Some((false, 12)))));
         assert_eq!(parse("/logs worker-3").unwrap(), Input::Cmd(Cmd::Logs("worker-3".into())));
-        for c in ["status", "review", "approve", "restart", "pause", "resume", "stop", "kill", "verbose", "gate", "tcb", "agents", "bulletin", "cost", "doctor", "clear", "quit"] {
+        for c in ["status", "review", "approve", "restart", "pause", "resume", "stop", "kill", "gate", "tcb", "agents", "bulletin", "cost", "doctor", "clear", "quit"] {
             assert!(matches!(parse(&format!("/{c}")), Ok(Input::Cmd(_))), "{c}");
         }
     }
