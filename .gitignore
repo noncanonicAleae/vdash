@@ -1,0 +1,12 @@
+target/
+campaigns/
+team/.gemini-conversation
+
+# third-party paper, not redistributed (see README)
+docs/references/
+
+# editor / OS / local scratch
+*.swp
+.DS_Store
+.claude/
+.vdash/
