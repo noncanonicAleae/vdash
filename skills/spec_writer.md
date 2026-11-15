@@ -14,7 +14,7 @@ theorem guarantees, so it must be faithful, strong and easy for a human to audit
   search tools (`WebSearch`, `WebFetch`) to check Lean 4 / Mathlib4 definitions and literature conventions.
 - Change files with your edit and write tools. Run `vdash check <file>`,
   `vdash axioms <file> <Name>...` and `vdash search "<query>"` from the campaign root. To read, use your read tool or `cat`, `head`, `tail`, `ls`,
-  `wc`, `grep`; chain or pipe them only with each other. Change files **only** with
+  `wc`, `grep`; chain or pipe them only with each other. Never `cd`: give every path from the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`); a `cd` followed by a `..` path is always denied. Change files **only** with
   your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
   `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
 

@@ -113,6 +113,11 @@ M4 interactive app · M5 spec phase · M6 amendments · M7 later · status log.
 - C11. `WebSearch` and `WebFetch` (with `--tools` listing them and `--allowedTools
   WebSearch WebFetch`) work headless on the subscription; `WebFetch` on
   `https://loogle.lean-lang.org/json?q=Finset.sum_nonneg` returned the hit list.
+- C14. (probed 2026-11-15, `haiku`, flags as `Profile::Lean`) `cd sub && cat f` and
+  `cd sub; cat f` run, but `cd` followed by any `..` path (`cd a && cat ../f`,
+  `cd a && grep -r x ..`) is denied. Skills say never `cd`; use root-relative paths.
+  In the `sequent-calculus` run after the C13 fix, 3 of 21 agents hit a denial (two
+  shell writes, one `cd …; cat ../…`); none lost its turn.
 - C13. (probed 2026-11-15, `haiku`, flags as `Profile::Lean`) With allow rules
   `Bash(cat *)`, `Bash(head *)`, `Bash(sed -n *)`, `Bash(ls *)`, `Bash(grep *)`:
   `cat f`, `head -2 f`, `sed -n 2p f`, `cd sub && cat f` and `cat f | grep x` run;
@@ -1573,3 +1578,6 @@ Gemini owns M8-03..M8-06.
   kind `repair` (id `repair_<module>`), pinned to its own file and verified by a clean
   build; repair goals are hidden from the architect and skipped by integrate. Test:
   `tests/engine.rs::stale_proved_goals_reopen_and_orphans_become_repair_goals`.
+- 2026-11-15 (Claude): remaining denied tool calls were shell writes (by design) and
+  `cd` + `..` reads (fact C14). Worker, falsifier, integrator and spec-writer skills
+  and the denied-turn retry now say never `cd` and use campaign-root paths.
