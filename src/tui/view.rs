@@ -428,7 +428,7 @@ fn side(f: &mut Frame, area: Rect, app: &App, ui: &Ui, p: &Palette) {
         goals.push(TLine::from(Span::styled("no plan yet", Style::default().fg(p.faint))));
     }
     let gw = g_area.width.saturating_sub(16) as usize;
-    for (status, color) in [("proved", p.good), ("claimed", p.info), ("open", p.muted), ("blocked", p.warn), ("refuted", p.bad)] {
+    for (status, color) in [("proved", p.good), ("claimed", p.info), ("open", p.muted), ("blocked", p.warn), ("refuted", p.bad), ("stale", p.faint)] {
         let n = app.goals.get(status).copied().unwrap_or(0);
         if n == 0 {
             continue;

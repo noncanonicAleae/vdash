@@ -24,6 +24,9 @@ order, so that the targets follow. You revise it when the team reports it is wro
    `witness` proving it holds on a concrete example.
 5. Keep goals that are already proved unchanged (same id, name and statement). The
    engine re-checks proved goals and reopens any that no longer build.
+   A goal with status `stale` is one nothing needs: Solution does not import its file
+   and no unaccepted target depends on it. Drop it, or, if it really is still needed,
+   list it in the `depends_on` of the goal that needs it.
 6. Read `<import_graph>`: every file under `lean/Apc/Proof/` that `Apc.Solution`
    imports should be the file of some goal. Do not leave a file tagged `ORPHAN` in
    Solution's imports; give its theorems goals, or have the target stop importing it.

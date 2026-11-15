@@ -1586,3 +1586,11 @@ Gemini owns M8-03..M8-06.
   `Lib/CutAdm`, `Lib/CutFreeProps` and `Lib/Resource`; the gate went from 0/15
   (`build_failed`) to 12/15, the other 3 at `bad_axioms`. No orphan needed a `repair`
   goal in that run, so that path is covered only by the engine test so far.
+- 2026-11-15 (Claude): workers spent round 15 re-proving `cut_adm`, a leftover goal in
+  `Lib/CutAdm.lean` that the re-check had reopened, although `cut_elimination` was
+  already accepted through `Work/CutElimLL.lean`. Fix: each orchestrate,
+  `team::retire_unneeded` computes the needed goals: those whose file Solution
+  imports, plus those an unaccepted target reaches through `depends_on`, stopping at
+  done goals. Broken proved goals are reopened only if needed. Unneeded open or broken
+  goals become `stale`: never assigned, and they ask the architect for a new plan.
+  Stale goals that are needed again reopen.

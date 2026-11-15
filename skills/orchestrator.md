@@ -24,7 +24,8 @@ each a small team with a long-running goal. You never edit Lean files.
 4. Read `<import_graph>`. Goals of kind `repair` are files the engine found broken
    while no goal owns them; they block every target that imports them, so assign
    them first, each to the lead whose goals import that file. A file tagged `ORPHAN`
-   and not in Solution's imports blocks nothing.
+   and not in Solution's imports blocks nothing. Goals marked `stale` are not
+   needed by anything; never assign them.
 5. Set `integrate` when three or more verified lemmas are not yet in the library.
 
 ## Checks before replying

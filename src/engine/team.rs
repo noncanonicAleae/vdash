@@ -140,9 +140,56 @@ fn import_graph_text(eng: &Engine, plan: &Plan) -> String {
     lean::imports::format_import_graph(&scan, &tags)
 }
 
-/// Re-verify every proved non-target goal against the current tree (the spec or a
-/// file it depends on may have changed since the goal was accepted); reopen failures.
-fn recheck_proved(eng: &Engine, round: u32, plan: &Plan) -> Result<()> {
+/// Goals the solution still needs: every goal whose file `Apc.Solution` imports, and
+/// every goal an unaccepted target reaches through `depends_on`. The walk stops at
+/// done goals (proved and still building, or accepted targets): what they once
+/// depended on is no longer needed. `broken` goals count as not done.
+fn needed_goals(eng: &Engine, plan: &Plan, st: &crate::paths::State, broken: &BTreeSet<String>) -> BTreeSet<String> {
+    let reach = lean::imports::scan_imports(&eng.ctx.campaign.lean_dir())
+        .map(|s| lean::imports::closure_of(&s.graph, &["Apc.Solution".to_string()]))
+        .unwrap_or_default();
+    let done = |g: &Goal| {
+        if broken.contains(&g.id) {
+            return false;
+        }
+        if g.kind == "target" {
+            st.targets.get(&g.lean_name).is_some_and(|t| t.accepted)
+        } else {
+            st.goals.get(&g.id).is_some_and(|x| x.status == "proved")
+        }
+    };
+    let mut needed: BTreeSet<String> = plan
+        .goals
+        .iter()
+        .filter(|g| g.kind == "target" || eng.ctx.campaign.module_name(&g.file).is_ok_and(|m| reach.contains(&m)))
+        .map(|g| g.id.clone())
+        .collect();
+    let mut stack: Vec<&Goal> = plan.goals.iter().filter(|g| g.kind == "target" && !done(g)).collect();
+    let mut seen = BTreeSet::new();
+    while let Some(g) = stack.pop() {
+        if !seen.insert(g.id.clone()) {
+            continue;
+        }
+        needed.insert(g.id.clone());
+        if done(g) && g.kind != "target" {
+            continue;
+        }
+        for d in &g.depends_on {
+            if let Some(dg) = plan.goal(d) {
+                if dg.kind == "target" && done(dg) {
+                    needed.insert(dg.id.clone());
+                } else {
+                    stack.push(dg);
+                }
+            }
+        }
+    }
+    needed
+}
+
+/// Proved non-target goals whose file no longer checks (the spec or a file it
+/// depends on may have changed since the goal was accepted).
+fn broken_proved(eng: &Engine, plan: &Plan) -> Result<BTreeSet<String>> {
     let st = eng.state()?;
     let mut by_file: BTreeMap<String, Vec<&Goal>> = BTreeMap::new();
     for g in &plan.goals {
@@ -150,23 +197,61 @@ fn recheck_proved(eng: &Engine, round: u32, plan: &Plan) -> Result<()> {
             by_file.entry(g.file.clone()).or_default().push(g);
         }
     }
-    let mut reopened = Vec::new();
+    let mut broken = BTreeSet::new();
     for (file, gs) in by_file {
         let names: Vec<String> = gs.iter().filter(|g| g.kind != "repair").map(|g| g.lean_name.clone()).collect();
-        if let Err(why) = check_decls(&eng.ctx, &file, &names) {
-            reopened.extend(gs.iter().map(|g| g.id.clone()));
-            eng.bulletin(round, "engine", &format!("proved goals in {file} no longer check ({why}); reopened: {}", gs.iter().map(|g| g.id.as_str()).collect::<Vec<_>>().join(", ")));
+        if check_decls(&eng.ctx, &file, &names).is_err() {
+            broken.extend(gs.iter().map(|g| g.id.clone()));
         }
     }
+    Ok(broken)
+}
+
+/// Reopen broken proved goals the solution still needs; retire unneeded open or
+/// broken goals as `stale` (and revive stale goals that are needed again). A newly
+/// stale goal asks the architect for a new plan.
+fn retire_unneeded(eng: &Engine, round: u32, plan: &Plan, broken: &BTreeSet<String>) -> Result<()> {
+    let st = eng.state()?;
+    let needed = needed_goals(eng, plan, &st, broken);
+    let (mut reopened, mut retired, mut revived) = (Vec::new(), Vec::new(), Vec::new());
+    for g in plan.goals.iter().filter(|g| g.kind != "target" && g.kind != "repair") {
+        let status = st.goals.get(&g.id).map(|x| x.status.as_str()).unwrap_or("open");
+        let need = needed.contains(&g.id);
+        match status {
+            "proved" if broken.contains(&g.id) => {
+                if need { reopened.push(g) } else { retired.push(g) }
+            }
+            "open" | "claimed" | "blocked" if !need => retired.push(g),
+            "stale" if need => revived.push(g),
+            _ => {}
+        }
+    }
+    if reopened.is_empty() && retired.is_empty() && revived.is_empty() {
+        return Ok(());
+    }
+    let ids = |v: &[&Goal]| v.iter().map(|g| g.id.as_str()).collect::<Vec<_>>().join(", ");
     if !reopened.is_empty() {
-        eng.update(|s| {
-            for id in &reopened {
-                if let Some(g) = s.goals.get_mut(id) {
-                    g.status = "open".into();
-                    g.verified_round = None;
+        let files: BTreeSet<&str> = reopened.iter().map(|g| g.file.as_str()).collect();
+        eng.bulletin(round, "engine", &format!("proved goals no longer check in {}; reopened: {}", files.into_iter().collect::<Vec<_>>().join(", "), ids(&reopened)));
+    }
+    if !retired.is_empty() {
+        eng.bulletin(round, "engine", &format!("goals retired as stale (nothing Solution imports or any unaccepted target needs them): {}", ids(&retired)));
+    }
+    if !revived.is_empty() {
+        eng.bulletin(round, "engine", &format!("stale goals needed again; reopened: {}", ids(&revived)));
+    }
+    eng.update(|s| {
+        for (gs, status) in [(&reopened, "open"), (&retired, "stale"), (&revived, "open")] {
+            for g in gs.iter() {
+                if let Some(x) = s.goals.get_mut(&g.id) {
+                    x.status = status.into();
+                    x.verified_round = None;
                 }
             }
-        })?;
+        }
+    })?;
+    if !retired.is_empty() {
+        set_rd(eng, &["next_revise_plan"], json!(true))?;
     }
     Ok(())
 }
@@ -518,16 +603,15 @@ pub struct LeadAssign {
 
 pub fn orchestrate(eng: &mut Engine, round: u32) -> Result<()> {
     let mut plan = load_plan(&eng.ctx).unwrap_or_else(|| fallback_plan(eng, 1));
-    if !eng.rechecked {
-        recheck_proved(eng, round, &plan)?;
-        eng.rechecked = true;
-    }
+    let broken = if eng.rechecked { BTreeSet::new() } else { broken_proved(eng, &plan)? };
+    eng.rechecked = true;
+    retire_unneeded(eng, round, &plan, &broken)?;
     plan = adopt_orphans(eng, round, plan)?;
     let st = eng.state()?;
     let open: BTreeSet<String> = plan
         .goals
         .iter()
-        .filter(|g| !matches!(st.goals.get(&g.id).map(|x| x.status.as_str()), Some("proved") | Some("refuted")))
+        .filter(|g| !matches!(st.goals.get(&g.id).map(|x| x.status.as_str()), Some("proved") | Some("refuted") | Some("stale")))
         .map(|g| g.id.clone())
         .collect();
     if open.is_empty() {
@@ -581,7 +665,9 @@ pub fn orchestrate(eng: &mut Engine, round: u32) -> Result<()> {
         eng.bulletin(round, "engine", "the orchestrator's grouping was unusable; one lead takes every open goal");
     }
     set_rd(eng, &["orchestrator"], json!({"leads": leads, "integrate": integrate}))?;
-    set_rd(eng, &["next_revise_plan"], json!(revise))?;
+    // The engine may already have asked for a new plan this round (stale goals).
+    let already = rd(eng, &["next_revise_plan"]).as_bool().unwrap_or(false);
+    set_rd(eng, &["next_revise_plan"], json!(revise || already))?;
     eng.update(|s| {
         for l in &leads {
             let e = s.leads.entry(l.lead_id.clone()).or_insert(crate::paths::LeadState { goal_ids: vec![], summary: String::new(), last_round: round });

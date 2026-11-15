@@ -328,6 +328,8 @@ fn stale_proved_goals_reopen_and_orphans_become_repair_goals() {
     fs::write(work.join("Broken.lean"), "namespace Apc\ntheorem broken_thing : 1 = 2 := rfl\nend Apc\n").unwrap();
     fs::write(work.join("Dangling.lean"), "import Apc.Proof.Work.Nope\n").unwrap();
     fs::write(lib.join("Stale.lean"), "namespace Apc\ntheorem stale_ok : 1 = 1 := by exact nonexistent_lemma\nend Apc\n").unwrap();
+    // Leftovers from an earlier plan that nothing needs any more.
+    fs::write(lib.join("Old.lean"), "namespace Apc\ntheorem old_ok : 1 = 1 := by exact nonexistent_lemma\nend Apc\n").unwrap();
     let sol = root.join("lean/Apc/Solution.lean");
     fs::write(&sol, format!("import Apc.Proof.Work.Broken\n{}", fs::read_to_string(&sol).unwrap())).unwrap();
 
@@ -335,15 +337,17 @@ fn stale_proved_goals_reopen_and_orphans_become_repair_goals() {
     let mut goals: Vec<_> = TARGETS
         .iter()
         .enumerate()
-        .map(|(i, t)| json!({"id": format!("t{}", i + 1), "kind": "target", "lean_name": t, "statement": format!("see Challenge.lean: {t}"), "file": "lean/Apc/Solution.lean", "depends_on": [], "parent_target": t}))
+        .map(|(i, t)| json!({"id": format!("t{}", i + 1), "kind": "target", "lean_name": t, "statement": format!("see Challenge.lean: {t}"), "file": "lean/Apc/Solution.lean", "depends_on": if i == 0 { vec!["s1"] } else { vec![] }, "parent_target": t}))
         .collect();
+    goals.push(json!({"id": "o1", "kind": "lemma", "lean_name": "Apc.old_ok", "statement": "theorem Apc.old_ok : 1 = 1", "file": "lean/Apc/Proof/Lib/Old.lean", "depends_on": [], "parent_target": "Apc.isort_correct"}));
+    goals.push(json!({"id": "o2", "kind": "lemma", "lean_name": "Apc.old_open", "statement": "theorem Apc.old_open : 2 = 2", "file": "lean/Apc/Proof/Work/OldOpen.lean", "depends_on": [], "parent_target": "Apc.isort_correct"}));
     goals.push(json!({"id": "s1", "kind": "lemma", "lean_name": "Apc.stale_ok", "statement": "theorem Apc.stale_ok : 1 = 1", "file": "lean/Apc/Proof/Lib/Stale.lean", "depends_on": [], "parent_target": "Apc.isort_correct"}));
     vdash::jsonio::write_atomic(ctx.campaign.plan_file(), &json!({"version": 1, "revision": 1, "goals": goals})).unwrap();
     vdash::util::update_state(&ctx.campaign, |s| {
         for g in &goals {
             let id = g["id"].as_str().unwrap().to_string();
             s.goals.insert(id.clone(), vdash::paths::GoalState {
-                status: if id == "s1" { "proved".into() } else { "open".into() },
+                status: if id == "s1" || id == "o1" { "proved".into() } else { "open".into() },
                 lean_name: g["lean_name"].as_str().unwrap().into(),
                 file: g["file"].as_str().unwrap().into(),
                 lead: None,
@@ -388,7 +392,8 @@ fn stale_proved_goals_reopen_and_orphans_become_repair_goals() {
     assert_eq!(run(&ctx, &pool, 1, false), 1);
 
     let bulletin = fs::read_to_string(ctx.campaign.bulletin_file()).unwrap();
-    assert!(bulletin.contains("lean/Apc/Proof/Lib/Stale.lean no longer check"), "{bulletin}");
+    assert!(bulletin.contains("proved goals no longer check in lean/Apc/Proof/Lib/Stale.lean; reopened: s1"), "{bulletin}");
+    assert!(bulletin.contains("goals retired as stale (nothing Solution imports or any unaccepted target needs them): o1, o2"), "{bulletin}");
     assert!(bulletin.contains("orphaned files adopted as repair goals: lean/Apc/Proof/Work/Broken.lean"), "{bulletin}");
     let orch = orch_prompt.lock().unwrap().clone();
     assert!(orch.contains("<import_graph>"), "{orch}");
@@ -398,6 +403,10 @@ fn stale_proved_goals_reopen_and_orphans_become_repair_goals() {
     assert!(prompts.iter().any(|p| p.contains("Repair lean/Apc/Proof/Work/Broken.lean") && p.contains("<import_graph>")), "{prompts:?}");
     let st = vdash::util::load_state(&ctx.campaign).unwrap();
     assert_eq!(st.goals["s1"].status, "proved", "{:?}", st.goals);
+    assert_eq!(st.goals["o1"].status, "stale", "{:?}", st.goals);
+    assert_eq!(st.goals["o2"].status, "stale", "{:?}", st.goals);
+    assert!(orch.contains("o1 [stale]"), "{orch}");
+    assert_eq!(st.round_data["next_revise_plan"], json!(true), "{:?}", st.round_data);
     assert_eq!(st.goals[repair_id].status, "proved", "{:?}", st.goals);
     assert!(!work.join("Elsewhere.lean").exists());
     // With the orphan repaired, the gate gets past the build to the per-target checks.
