@@ -3,6 +3,7 @@
 //! usage limit while the other keeps working.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,9 @@ pub struct Pool {
     inner: Mutex<Inner>,
     cv: Condvar,
     pub timing: Timing,
+    /// The engine's stop flag. Once set, a failed attempt is returned instead of
+    /// retried and nobody waits for a paused backend (a kill must not spawn agents).
+    stop: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// Which backend actually served a call.
@@ -77,6 +81,7 @@ impl Pool {
             backends: map,
             inner: Mutex::new(Inner { health, overrides: BTreeMap::new() }),
             cv: Condvar::new(),
+            stop: Mutex::new(None),
             timing: Timing::from_ctx(ctx),
         }
     }
@@ -146,6 +151,16 @@ impl Pool {
     /// Run one call for `role`, choosing a backend. Blocks while every candidate is
     /// busy or paused. `Err` only when every candidate stayed paused past the wait
     /// budget (exit code 4) or none is configured.
+    /// Share the engine's stop flag with the pool.
+    pub fn set_stop(&self, flag: Arc<AtomicBool>) {
+        *self.stop.lock().unwrap() = Some(flag);
+    }
+
+    /// True once the engine has been asked to stop.
+    pub fn stopping(&self) -> bool {
+        self.stop.lock().unwrap().as_ref().is_some_and(|f| f.load(AtomicOrdering::SeqCst))
+    }
+
     pub fn run(&self, ctx: &Ctx, round: u32, role: Role, call: &AgentCall) -> crate::error::Result<Served> {
         self.run_cb(ctx, round, role, call, &|_| {})
     }
@@ -221,6 +236,9 @@ impl Pool {
                         h.calls += 1;
                         Some(e)
                     }
+                    None if self.stopping() => {
+                        return Err(crate::error::VdashError::new(130, format!("stopped while waiting for a backend for role {role}")));
+                    }
                     None => {
                         let wait = earliest
                             .map(|t| t.saturating_duration_since(now))
@@ -241,7 +259,14 @@ impl Pool {
             let mut g = self.inner.lock().unwrap();
             let h = g.health.get_mut(&entry.backend).unwrap();
             h.in_use -= 1;
+            let stopping = self.stopping();
             match &result.failure {
+                // A stop (or kill) is under way: report the failure, never retry it.
+                Some(_) if stopping => {
+                    drop(g);
+                    self.cv.notify_all();
+                    return Ok(Served { result, entry });
+                }
                 Some(Failure::Quota) => {
                     h.paused_since.get_or_insert_with(Instant::now);
                     let d = (self.timing.base * 2u32.saturating_pow(h.step)).min(self.timing.cap);
@@ -464,6 +489,40 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(400));
         // 20, 40, 80, 160, (cap 200)... within ~400ms only a handful of attempts.
         assert!(c.count(Role::Critic) <= 6, "{}", c.count(Role::Critic));
+    }
+
+    #[test]
+    fn stop_flag_ends_retries_and_quota_waits() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_with(&tmp, "");
+        let c = Arc::new(FakeBackend::new(BackendKind::Claude));
+        c.fail(Role::Critic, Failure::Crash);
+        let mut pool = Pool::new(&ctx, vec![c.clone()]);
+        fast(&mut pool);
+        let stop = Arc::new(AtomicBool::new(true));
+        pool.set_stop(stop.clone());
+        // A crash (a killed agent) is reported, not retried.
+        let s = pool.run(&ctx, 1, Role::Critic, &call(Role::Critic)).unwrap();
+        assert_eq!(s.result.failure, Some(Failure::Crash));
+        assert_eq!(c.count(Role::Critic), 1);
+        // With the only backend paused, a stopping pool gives up instead of waiting.
+        c.fail(Role::Critic, Failure::Quota);
+        pool.timing.base = Duration::from_secs(30);
+        pool.timing.cap = Duration::from_secs(30);
+        pool.timing.max_wait = Duration::from_secs(120);
+        stop.store(false, Ordering::SeqCst);
+        let t = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                stop.store(true, Ordering::SeqCst);
+            }
+        });
+        let started = Instant::now();
+        let e = pool.run(&ctx, 1, Role::Critic, &call(Role::Critic)).err().expect("stopped");
+        t.join().unwrap();
+        assert_eq!(e.code, 130);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]

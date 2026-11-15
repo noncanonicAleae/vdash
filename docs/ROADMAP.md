@@ -1594,3 +1594,12 @@ Gemini owns M8-03..M8-06.
   done goals. Broken proved goals are reopened only if needed. Unneeded open or broken
   goals become `stale`: never assigned, and they ask the architect for a new plan.
   Stale goals that are needed again reopen.
+- 2026-11-15 (Claude): `vdash kill` left an orphaned worker. Killing an agent made the
+  pool treat it as a crash and retry, and `kill` listed the engine's children only
+  after SIGKILLing it, by which time the retry had been reparented to init. Fixes:
+  the pool shares the engine's stop flag (`Pool::set_stop`). Once it is set, a failed
+  attempt is returned, not retried, and waiting on a paused backend ends with code
+  130; `agents::run` skips its repair call. `kill` keeps collecting descendants
+  through the grace period and SIGSTOPs the engine before the final sweep. Also fixed
+  a regression from the stale-goal change: a fresh lemma whose `parent_target` is
+  unaccepted counts as needed (it was retired before any edge reached it).

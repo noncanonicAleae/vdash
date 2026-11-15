@@ -140,8 +140,9 @@ fn import_graph_text(eng: &Engine, plan: &Plan) -> String {
     lean::imports::format_import_graph(&scan, &tags)
 }
 
-/// Goals the solution still needs: every goal whose file `Apc.Solution` imports, and
-/// every goal an unaccepted target reaches through `depends_on`. The walk stops at
+/// Goals the solution still needs: every goal whose file `Apc.Solution` imports,
+/// every unfinished goal whose `parent_target` is unaccepted, and every goal those
+/// and the unaccepted targets reach through `depends_on`. The walk stops at
 /// done goals (proved and still building, or accepted targets): what they once
 /// depended on is no longer needed. `broken` goals count as not done.
 fn needed_goals(eng: &Engine, plan: &Plan, st: &crate::paths::State, broken: &BTreeSet<String>) -> BTreeSet<String> {
@@ -164,7 +165,18 @@ fn needed_goals(eng: &Engine, plan: &Plan, st: &crate::paths::State, broken: &BT
         .filter(|g| g.kind == "target" || eng.ctx.campaign.module_name(&g.file).is_ok_and(|m| reach.contains(&m)))
         .map(|g| g.id.clone())
         .collect();
-    let mut stack: Vec<&Goal> = plan.goals.iter().filter(|g| g.kind == "target" && !done(g)).collect();
+    // A goal serving an unaccepted target (its `parent_target`) is needed even before
+    // any `depends_on` edge or import reaches it: it may be a fresh lemma.
+    let unaccepted_target = |pt: &str| {
+        plan.goals.iter().filter(|t| t.kind == "target").any(|t| {
+            (t.id == pt || t.lean_name == pt || t.lean_name.strip_prefix("Apc.") == Some(pt)) && !done(t)
+        })
+    };
+    let mut stack: Vec<&Goal> = plan
+        .goals
+        .iter()
+        .filter(|g| if g.kind == "target" { !done(g) } else { !done(g) && unaccepted_target(&g.parent_target) })
+        .collect();
     let mut seen = BTreeSet::new();
     while let Some(g) = stack.pop() {
         if !seen.insert(g.id.clone()) {

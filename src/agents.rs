@@ -160,6 +160,9 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
         }
         if errs.is_empty() {
             Outcome::Ok(result.structured.clone().unwrap())
+        } else if pool.stopping() {
+            // No repair call while a stop or kill is under way.
+            Outcome::Failed(format!("stopped before a repair attempt: {}", errs.join("; ")))
         } else {
             attempts.push(json!({"argv": result.argv, "raw": result.raw, "errors": errs}));
             // One repair attempt on the same role.

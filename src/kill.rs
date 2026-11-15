@@ -74,22 +74,32 @@ pub fn kill(ctx: &Ctx) -> Result<String> {
     let Some(engine) = events::engine_running(ctx) else {
         return Err(VdashError::new(2, "no engine is running for this campaign"));
     };
-    let kids = descendants(engine);
+    let mut all = descendants(engine);
     if let Some(p) = pid_of(engine) {
         let _ = kill_process(p, Signal::Term);
     }
-    kill_all(&kids, Signal::Term);
+    kill_all(&all, Signal::Term);
+    // Keep collecting while the engine lives: a process it starts during the grace
+    // period would otherwise be reparented to init when the engine dies, and survive.
+    let collect = |all: &mut Vec<u32>| {
+        for k in descendants(engine) {
+            if !all.contains(&k) {
+                all.push(k);
+            }
+        }
+    };
     let start = Instant::now();
     while alive(engine) && start.elapsed() < GRACE {
+        collect(&mut all);
         thread::sleep(Duration::from_millis(100));
     }
     let forced = alive(engine);
     if let Some(p) = pid_of(engine) {
+        // Freeze it so it cannot start anything between the last sweep and its death.
+        let _ = kill_process(p, Signal::Stop);
+        collect(&mut all);
         let _ = kill_process(p, Signal::Kill);
     }
-    // Anything the engine started, including children it spawned during the grace period.
-    let mut all = kids;
-    all.extend(descendants(engine));
     kill_all(&all, Signal::Kill);
     thread::sleep(Duration::from_millis(200));
     events::emit(ctx, 0, "engine_killed", serde_json::json!({"pid": engine, "forced": forced}));
@@ -138,7 +148,9 @@ mod tests {
         let mut eng = Command::new("flock")
             .arg(&lock)
             .args(["sh", "-c"])
-            .arg(format!("echo $$ > {}; sleep 60 & wait", lock.display()))
+            // Ignores SIGTERM like a busy engine, and starts a "retry" child after the
+            // kill began; that late child must not survive as an orphan.
+            .arg(format!("trap '' TERM; echo $$ > {}; sleep 60 & sleep 1; (exec -a vdash-late-child-$$ sleep 61) & wait", lock.display()))
             .spawn()
             .unwrap();
         let start = Instant::now();
@@ -148,6 +160,15 @@ mod tests {
         let pid = events::engine_running(&ctx).expect("stand-in engine holds the lock");
         let msg = kill(&ctx).unwrap();
         assert!(msg.contains(&pid.to_string()), "{msg}");
+        assert!(msg.contains("had to SIGKILL"), "{msg}");
+        thread::sleep(Duration::from_millis(300));
+        let late = format!("vdash-late-child-{pid}");
+        let survivors: Vec<u32> = process_table()
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains(&late)) && alive(*p))
+            .collect();
+        assert!(survivors.is_empty(), "late child survived the kill: {survivors:?}");
         let _ = eng.wait();
         assert!(events::engine_running(&ctx).is_none());
         assert!(!alive(pid));

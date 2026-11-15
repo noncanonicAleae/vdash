@@ -50,6 +50,7 @@ pub struct Engine<'p> {
 
 impl<'p> Engine<'p> {
     pub fn new(ctx: Ctx, pool: &'p Pool, opts: Opts, stop: Arc<AtomicBool>) -> Self {
+        pool.set_stop(Arc::clone(&stop));
         Engine { ctx, pool, stop, opts, snap: None, decisions: Vec::new(), rechecked: false }
     }
 

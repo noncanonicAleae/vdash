@@ -339,8 +339,8 @@ fn stale_proved_goals_reopen_and_orphans_become_repair_goals() {
         .enumerate()
         .map(|(i, t)| json!({"id": format!("t{}", i + 1), "kind": "target", "lean_name": t, "statement": format!("see Challenge.lean: {t}"), "file": "lean/Apc/Solution.lean", "depends_on": if i == 0 { vec!["s1"] } else { vec![] }, "parent_target": t}))
         .collect();
-    goals.push(json!({"id": "o1", "kind": "lemma", "lean_name": "Apc.old_ok", "statement": "theorem Apc.old_ok : 1 = 1", "file": "lean/Apc/Proof/Lib/Old.lean", "depends_on": [], "parent_target": "Apc.isort_correct"}));
-    goals.push(json!({"id": "o2", "kind": "lemma", "lean_name": "Apc.old_open", "statement": "theorem Apc.old_open : 2 = 2", "file": "lean/Apc/Proof/Work/OldOpen.lean", "depends_on": [], "parent_target": "Apc.isort_correct"}));
+    goals.push(json!({"id": "o1", "kind": "lemma", "lean_name": "Apc.old_ok", "statement": "theorem Apc.old_ok : 1 = 1", "file": "lean/Apc/Proof/Lib/Old.lean", "depends_on": [], "parent_target": "Apc.gone_target"}));
+    goals.push(json!({"id": "o2", "kind": "lemma", "lean_name": "Apc.old_open", "statement": "theorem Apc.old_open : 2 = 2", "file": "lean/Apc/Proof/Work/OldOpen.lean", "depends_on": [], "parent_target": "Apc.gone_target"}));
     goals.push(json!({"id": "s1", "kind": "lemma", "lean_name": "Apc.stale_ok", "statement": "theorem Apc.stale_ok : 1 = 1", "file": "lean/Apc/Proof/Lib/Stale.lean", "depends_on": [], "parent_target": "Apc.isort_correct"}));
     vdash::jsonio::write_atomic(ctx.campaign.plan_file(), &json!({"version": 1, "revision": 1, "goals": goals})).unwrap();
     vdash::util::update_state(&ctx.campaign, |s| {
