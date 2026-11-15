@@ -1581,3 +1581,8 @@ Gemini owns M8-03..M8-06.
 - 2026-11-15 (Claude): remaining denied tool calls were shell writes (by design) and
   `cd` + `..` reads (fact C14). Worker, falsifier, integrator and spec-writer skills
   and the denied-turn retry now say never `cd` and use campaign-root paths.
+- 2026-11-15 (Claude): **fixed**, the `sequent-calculus` "stuck at `build_failed` after
+  restart" issue. Live evidence: in round 14 `recheck_proved` reopened 10 stale goals in
+  `Lib/CutAdm`, `Lib/CutFreeProps` and `Lib/Resource`; the gate went from 0/15
+  (`build_failed`) to 12/15, the other 3 at `bad_axioms`. No orphan needed a `repair`
+  goal in that run, so that path is covered only by the engine test so far.
