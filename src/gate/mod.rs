@@ -196,7 +196,8 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
     // A module in the solution closure counts as trusted ONLY if it starts with
     // `Apc.Spec.` AND a file with the same relative path exists in `.heldout/lean/`
     // with identical bytes.
-    let sol_graph = lean::imports::import_graph(&sol_tree)?;
+    // Only the solution's own closure matters; a broken import elsewhere must not fail the gate.
+    let sol_graph = lean::imports::scan_imports(&sol_tree)?.graph;
     let sol_closure = lean::imports::closure_of(&sol_graph, &sol_target);
     let untrusted_mods: Vec<String> = sol_closure
         .into_iter()

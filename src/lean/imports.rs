@@ -139,13 +139,22 @@ fn tree_rel_to_module(rel: &Path) -> Result<String> {
     Ok(parts.join("."))
 }
 
-pub fn import_graph(tree: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportScan {
+    pub graph: BTreeMap<String, Vec<String>>,
+    pub rel_paths: BTreeMap<String, PathBuf>,
+    /// `(importer_module, missing_dep_module, importer_rel_path)`
+    pub missing: Vec<(String, String, PathBuf)>,
+}
+
+/// Scan every `*.lean` file under `<tree>/Apc/` and collect its `Apc.*` imports
+/// without failing when an edge targets a missing module.
+pub fn scan_imports(tree: &Path) -> Result<ImportScan> {
     let apc_dir = tree.join("Apc");
-    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut mod_to_rel: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut scan = ImportScan::default();
 
     if !apc_dir.is_dir() {
-        return Ok(graph);
+        return Ok(scan);
     }
 
     for entry in WalkDir::new(&apc_dir).follow_links(false) {
@@ -168,26 +177,73 @@ pub fn import_graph(tree: &Path) -> Result<BTreeMap<String, Vec<String>>> {
                 deps.push(imp);
             }
         }
-        mod_to_rel.insert(mod_name.clone(), rel.to_path_buf());
-        graph.insert(mod_name, deps);
+        scan.rel_paths.insert(mod_name.clone(), rel.to_path_buf());
+        scan.graph.insert(mod_name, deps);
     }
 
-    for (mod_name, deps) in &graph {
+    for (mod_name, deps) in &scan.graph {
+        let rel = scan
+            .rel_paths
+            .get(mod_name)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(mod_name));
         for dep in deps {
-            if !graph.contains_key(dep) {
-                let rel = mod_to_rel
-                    .get(mod_name)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| mod_name.clone());
-                return Err(VdashError::new(
-                    1,
-                    format!("{rel} imports missing module {dep}"),
-                ));
+            if !scan.graph.contains_key(dep) {
+                scan.missing.push((mod_name.clone(), dep.clone(), rel.clone()));
             }
         }
     }
 
-    Ok(graph)
+    Ok(scan)
+}
+
+/// Format a compact summary of the `Apc.*` import graph for agent prompts.
+/// `tags` maps module names to status annotations (e.g. `in-Solution`, `ERROR`,
+/// `ORPHAN`). Missing `Apc.*` imports are always marked inline as `[MISSING]`.
+pub fn format_import_graph(scan: &ImportScan, tags: &BTreeMap<String, Vec<String>>) -> String {
+    if scan.graph.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::with_capacity(scan.graph.len());
+    for (mod_name, deps) in &scan.graph {
+        let rel = scan
+            .rel_paths
+            .get(mod_name)
+            .map(|p| format!("lean/{}", p.display()))
+            .unwrap_or_else(|| mod_name.clone());
+        let tag_str = tags
+            .get(mod_name)
+            .filter(|t| !t.is_empty())
+            .map(|t| format!(" [{}]", t.join(", ")))
+            .unwrap_or_default();
+        let dep_str = if deps.is_empty() {
+            "(no Apc imports)".to_string()
+        } else {
+            deps.iter()
+                .map(|d| {
+                    if scan.graph.contains_key(d) {
+                        d.clone()
+                    } else {
+                        format!("{d} [MISSING]")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!("{mod_name} ({rel}){tag_str} -> {dep_str}"));
+    }
+    lines.join("\n")
+}
+
+pub fn import_graph(tree: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+    let scan = scan_imports(tree)?;
+    if let Some((_, dep, rel)) = scan.missing.first() {
+        return Err(VdashError::new(
+            1,
+            format!("{} imports missing module {dep}", rel.display()),
+        ));
+    }
+    Ok(scan.graph)
 }
 
 fn find_cycle(remaining: &BTreeSet<String>, graph: &BTreeMap<String, Vec<String>>) -> Vec<String> {
@@ -356,6 +412,17 @@ def x : Nat := 1
             "unexpected error: {}",
             err.message
         );
+
+        // scan_imports does not fail on missing modules, and format_import_graph marks them.
+        let scan = scan_imports(tree).unwrap();
+        assert_eq!(scan.missing.len(), 1);
+        assert_eq!(scan.missing[0].0, "Apc.Bad");
+        assert_eq!(scan.missing[0].1, "Apc.Spec.DoesNotExist");
+        let mut tags = BTreeMap::new();
+        tags.insert("Apc.Bad".to_string(), vec!["ORPHAN".to_string()]);
+        let rendered = format_import_graph(&scan, &tags);
+        assert!(rendered.contains("Apc.Spec.Defs (lean/Apc/Spec/Defs.lean) -> Apc.Spec.Impl"));
+        assert!(rendered.contains("Apc.Bad (lean/Apc/Bad.lean) [ORPHAN] -> Apc.Spec.DoesNotExist [MISSING]"));
     }
 
     #[test]

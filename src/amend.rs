@@ -626,7 +626,7 @@ pub fn apply(ctx: &Ctx, n: u32, approved_by: &str) -> Result<()> {
 
     // Determine which goals depend on the edited file
     let edited_mod = ctx.campaign.module_name(&rec.file).ok();
-    let import_graph = lean::imports::import_graph(&tree).unwrap_or_default();
+    let import_graph = lean::imports::scan_imports(&tree).map(|s| s.graph).unwrap_or_default();
 
     let round = util::load_state(&ctx.campaign)
         .map(|s| s.round)

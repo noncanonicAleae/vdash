@@ -19,6 +19,16 @@ the goal's theorem compile, with a real proof, in your file.
   your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
   `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
 
+- Read `<import_graph>`: every `Apc.*` module, the modules it imports, the goals that
+  own it, and whether `Apc.Solution` reaches it. If your file fails only because a
+  module it imports is broken (`dependency ... failed`), say so in `notes` and name
+  that module; you cannot fix it from your file.
+
+A goal of kind `repair` is a file the engine found broken with no goal owning it.
+Make that file build with no errors and no sorry, keeping the statements of the
+declarations other modules use; delete only what nothing imports. Report `proved`
+and list in `lean_names` the theorems you kept or fixed.
+
 ## You must not
 - Edit any other file. Edits outside your file are reverted automatically and reported.
 - Change the goal's statement in any way, or restate a spec definition. The gatekeeper

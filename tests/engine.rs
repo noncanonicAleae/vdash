@@ -310,3 +310,96 @@ fn solution_partial_sorry_checked_per_theorem_and_sandbox_stuck_recovered() {
     // t3 ran only once (no wasted retries on OK (N sorry)); l1 ran twice (stuck -> confirm proved).
     assert_eq!(claude.count(Role::Worker), 3);
 }
+
+/// The sequent-calculus failure modes: a goal marked proved whose file no longer
+/// builds, an orphaned file that breaks Solution.lean, and an unrelated file with a
+/// missing import. The engine reopens the stale goal, adopts the orphan as a repair
+/// goal, shows agents the import graph, and nothing is blinded by the dangling import.
+#[test]
+fn stale_proved_goals_reopen_and_orphans_become_repair_goals() {
+    require_lean!();
+    let tmp = TempDir::new().unwrap();
+    let ctx = approved_isort(&tmp);
+    let root = ctx.campaign.root.clone();
+    let work = root.join("lean/Apc/Proof/Work");
+    let lib = root.join("lean/Apc/Proof/Lib");
+    fs::create_dir_all(&work).unwrap();
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(work.join("Broken.lean"), "namespace Apc\ntheorem broken_thing : 1 = 2 := rfl\nend Apc\n").unwrap();
+    fs::write(work.join("Dangling.lean"), "import Apc.Proof.Work.Nope\n").unwrap();
+    fs::write(lib.join("Stale.lean"), "namespace Apc\ntheorem stale_ok : 1 = 1 := by exact nonexistent_lemma\nend Apc\n").unwrap();
+    let sol = root.join("lean/Apc/Solution.lean");
+    fs::write(&sol, format!("import Apc.Proof.Work.Broken\n{}", fs::read_to_string(&sol).unwrap())).unwrap();
+
+    // A plan from before the spec changed: s1 is recorded as proved.
+    let mut goals: Vec<_> = TARGETS
+        .iter()
+        .enumerate()
+        .map(|(i, t)| json!({"id": format!("t{}", i + 1), "kind": "target", "lean_name": t, "statement": format!("see Challenge.lean: {t}"), "file": "lean/Apc/Solution.lean", "depends_on": [], "parent_target": t}))
+        .collect();
+    goals.push(json!({"id": "s1", "kind": "lemma", "lean_name": "Apc.stale_ok", "statement": "theorem Apc.stale_ok : 1 = 1", "file": "lean/Apc/Proof/Lib/Stale.lean", "depends_on": [], "parent_target": "Apc.isort_correct"}));
+    vdash::jsonio::write_atomic(ctx.campaign.plan_file(), &json!({"version": 1, "revision": 1, "goals": goals})).unwrap();
+    vdash::util::update_state(&ctx.campaign, |s| {
+        for g in &goals {
+            let id = g["id"].as_str().unwrap().to_string();
+            s.goals.insert(id.clone(), vdash::paths::GoalState {
+                status: if id == "s1" { "proved".into() } else { "open".into() },
+                lean_name: g["lean_name"].as_str().unwrap().into(),
+                file: g["file"].as_str().unwrap().into(),
+                lead: None,
+                verified_round: Some(1),
+            });
+        }
+        s.round_data = json!({});
+    })
+    .unwrap();
+
+    let claude = Arc::new(FakeBackend::new(BackendKind::Claude));
+    let repair_id = "repair_Apc_Proof_Work_Broken";
+    let orch_prompt = Arc::new(std::sync::Mutex::new(String::new()));
+    let op = orch_prompt.clone();
+    claude.func(Role::Orchestrator, move |call| {
+        *op.lock().unwrap() = call.prompt.clone();
+        json!({"leads": [{"lead_id": "L1", "goal_ids": [repair_id, "s1"], "brief": "repairs"}], "revise_plan": false, "integrate": false, "notes": ""})
+    });
+    claude.reply(Role::TeamLead, json!({"refute": [], "shared": {"definitions": [], "lemma_statements": [], "conventions": ""},
+        "assignments": [
+            // The wrong file: a repair goal is pinned to its own file.
+            {"goal_id": repair_id, "file": "lean/Apc/Proof/Work/Elsewhere.lean", "instructions": "", "existing_lemmas": []},
+            {"goal_id": "s1", "file": "lean/Apc/Proof/Lib/Stale.lean", "instructions": "", "existing_lemmas": []}]}));
+    claude.reply(Role::TeamLead, json!({"summary": "done", "goal_status": {}, "notes": "", "bulletin": [], "amendments": [], "escalations": []}));
+    let (w1, w2) = (work.clone(), lib.clone());
+    let worker_prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let wp = worker_prompts.clone();
+    let worker = move |call: &vdash::backend::AgentCall| {
+        wp.lock().unwrap().push(call.prompt.clone());
+        if call.prompt.contains("Repair lean/Apc/Proof/Work/Broken.lean") {
+            fs::write(w1.join("Broken.lean"), "namespace Apc\ntheorem broken_thing : 2 = 2 := rfl\nend Apc\n").unwrap();
+            worker_reply(repair_id, &["Apc.broken_thing"])
+        } else {
+            fs::write(w2.join("Stale.lean"), "namespace Apc\ntheorem stale_ok : 1 = 1 := rfl\nend Apc\n").unwrap();
+            worker_reply("s1", &["Apc.stale_ok"])
+        }
+    };
+    for _ in 0..4 {
+        claude.func(Role::Worker, worker.clone());
+    }
+    let pool = Pool::new(&ctx, vec![claude.clone()]);
+    assert_eq!(run(&ctx, &pool, 1, false), 1);
+
+    let bulletin = fs::read_to_string(ctx.campaign.bulletin_file()).unwrap();
+    assert!(bulletin.contains("lean/Apc/Proof/Lib/Stale.lean no longer check"), "{bulletin}");
+    assert!(bulletin.contains("orphaned files adopted as repair goals: lean/Apc/Proof/Work/Broken.lean"), "{bulletin}");
+    let orch = orch_prompt.lock().unwrap().clone();
+    assert!(orch.contains("<import_graph>"), "{orch}");
+    assert!(orch.contains("Apc.Proof.Work.Nope [MISSING]"), "{orch}");
+    assert!(orch.contains("Apc.Proof.Work.Dangling (lean/Apc/Proof/Work/Dangling.lean) [ORPHAN"), "{orch}");
+    let prompts = worker_prompts.lock().unwrap().clone();
+    assert!(prompts.iter().any(|p| p.contains("Repair lean/Apc/Proof/Work/Broken.lean") && p.contains("<import_graph>")), "{prompts:?}");
+    let st = vdash::util::load_state(&ctx.campaign).unwrap();
+    assert_eq!(st.goals["s1"].status, "proved", "{:?}", st.goals);
+    assert_eq!(st.goals[repair_id].status, "proved", "{:?}", st.goals);
+    assert!(!work.join("Elsewhere.lean").exists());
+    // With the orphan repaired, the gate gets past the build to the per-target checks.
+    assert!(st.targets.values().all(|t| !t.reasons.iter().any(|r| r == "build_failed")), "{:?}", st.targets);
+}

@@ -13,6 +13,7 @@ pub fn budget(section: &str) -> (usize, bool) {
         "file" | "spec" | "spec_files" | "challenge" => (30000, false),
         "guidance" => (3000, true),
         "events" => (6000, true),
+        "import_graph" => (8000, false),
         _ => (12000, false),
     }
 }

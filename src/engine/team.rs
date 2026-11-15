@@ -105,10 +105,131 @@ fn verified_lemmas(eng: &Engine, plan: &Plan) -> String {
     };
     plan.goals
         .iter()
-        .filter(|g| g.kind != "target" && st.goals.get(&g.id).is_some_and(|x| x.status == "proved"))
+        .filter(|g| matches!(g.kind.as_str(), "lemma" | "witness") && st.goals.get(&g.id).is_some_and(|x| x.status == "proved"))
         .map(|g| format!("{} ({}): {}", g.lean_name, g.file, g.statement))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The `Apc.*` import graph for agent prompts, tagged with the goals that own each
+/// module, whether `Apc.Solution` reaches it, and orphans (Proof files no goal owns).
+fn import_graph_text(eng: &Engine, plan: &Plan) -> String {
+    let tree = eng.ctx.campaign.lean_dir();
+    let Ok(scan) = lean::imports::scan_imports(&tree) else { return String::new() };
+    let st = eng.state().ok();
+    let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for g in &plan.goals {
+        if let Ok(m) = eng.ctx.campaign.module_name(&g.file) {
+            let status = st.as_ref().and_then(|s| s.goals.get(&g.id)).map(|x| x.status.clone()).unwrap_or_else(|| "open".into());
+            owners.entry(m).or_default().push(format!("{}:{status}", g.id));
+        }
+    }
+    let reach = lean::imports::closure_of(&scan.graph, &["Apc.Solution".to_string()]);
+    let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for m in scan.graph.keys() {
+        let t = tags.entry(m.clone()).or_default();
+        if let Some(o) = owners.get(m) {
+            t.push(format!("goal {}", o.join(" ")));
+        } else if m.starts_with("Apc.Proof.") {
+            t.push("ORPHAN: no goal owns this file".into());
+        }
+        if reach.contains(m) {
+            t.push("in Solution's imports".into());
+        }
+    }
+    lean::imports::format_import_graph(&scan, &tags)
+}
+
+/// Re-verify every proved non-target goal against the current tree (the spec or a
+/// file it depends on may have changed since the goal was accepted); reopen failures.
+fn recheck_proved(eng: &Engine, round: u32, plan: &Plan) -> Result<()> {
+    let st = eng.state()?;
+    let mut by_file: BTreeMap<String, Vec<&Goal>> = BTreeMap::new();
+    for g in &plan.goals {
+        if g.kind != "target" && st.goals.get(&g.id).is_some_and(|x| x.status == "proved") {
+            by_file.entry(g.file.clone()).or_default().push(g);
+        }
+    }
+    let mut reopened = Vec::new();
+    for (file, gs) in by_file {
+        let names: Vec<String> = gs.iter().filter(|g| g.kind != "repair").map(|g| g.lean_name.clone()).collect();
+        if let Err(why) = check_decls(&eng.ctx, &file, &names) {
+            reopened.extend(gs.iter().map(|g| g.id.clone()));
+            eng.bulletin(round, "engine", &format!("proved goals in {file} no longer check ({why}); reopened: {}", gs.iter().map(|g| g.id.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+    }
+    if !reopened.is_empty() {
+        eng.update(|s| {
+            for id in &reopened {
+                if let Some(g) = s.goals.get_mut(id) {
+                    g.status = "open".into();
+                    g.verified_round = None;
+                }
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Find orphaned files that break the solution and give each a `repair` goal.
+/// An orphan is a `Apc.Proof.*` module reachable from `Apc.Solution` or from a goal's
+/// file that no goal owns and that fails to build or contains sorry, while every
+/// module it imports is fine (so the repair addresses a root cause).
+fn adopt_orphans(eng: &Engine, round: u32, plan: Plan) -> Result<Plan> {
+    let tree = eng.ctx.campaign.lean_dir();
+    let scan = lean::imports::scan_imports(&tree)?;
+    let owned: BTreeSet<String> = plan.goals.iter().filter(|g| g.kind != "repair").filter_map(|g| eng.ctx.campaign.module_name(&g.file).ok()).collect();
+    let mut roots: Vec<String> = owned.iter().filter(|m| scan.graph.contains_key(*m)).cloned().collect();
+    roots.push("Apc.Solution".into());
+    roots.retain(|m| scan.graph.contains_key(m));
+    let reach = lean::imports::closure_of(&scan.graph, &roots);
+    let candidates: Vec<String> = reach.iter().filter(|m| m.starts_with("Apc.Proof.") && !owned.contains(*m)).cloned().collect();
+    let mut repairs = Vec::new();
+    if !candidates.is_empty() {
+        // Build each root separately: one broken root must not hide the others' results.
+        let mut results: BTreeMap<String, lean::build::ModuleResult> = BTreeMap::new();
+        for r in &roots {
+            if let Ok(rep) = lean::build::build(&eng.ctx, &tree, &eng.ctx.campaign.build_work_dir(), Some(std::slice::from_ref(r))) {
+                results.extend(rep.results);
+            }
+        }
+        let bad = |m: &str| results.get(m).is_some_and(|r| !r.ok || r.diagnostics.iter().any(|d| d.kind == "hasSorry"));
+        let parent = plan.goals.iter().find(|g| g.kind == "target").map(|g| g.parent_target.clone()).unwrap_or_default();
+        for m in candidates {
+            let deps_fine = scan.graph[&m].iter().all(|d| !bad(d) && scan.graph.contains_key(d));
+            if bad(&m) && deps_fine {
+                if let Some(rel) = scan.rel_paths.get(&m) {
+                    repairs.push(plan::repair_goal(&m, &format!("lean/{}", rel.display()), &parent));
+                }
+            }
+        }
+    }
+    let new_plan = plan::with_repairs(&plan, repairs);
+    if new_plan != plan {
+        jsonio::write_atomic(eng.ctx.campaign.plan_file(), &new_plan)?;
+        let adopted: Vec<String> = new_plan.goals.iter().filter(|g| g.kind == "repair").map(|g| g.file.clone()).collect();
+        if !adopted.is_empty() {
+            eng.bulletin(round, "engine", &format!("orphaned files adopted as repair goals: {}", adopted.join(", ")));
+        }
+    }
+    // Every listed repair goal is broken right now, so none of them is proved.
+    eng.update(|s| {
+        s.goals.retain(|id, _| !id.starts_with(plan::REPAIR_PREFIX) || new_plan.goal(id).is_some());
+        for g in new_plan.goals.iter().filter(|g| g.kind == "repair") {
+            let gs = s.goals.entry(g.id.clone()).or_insert(crate::paths::GoalState {
+                status: "open".into(),
+                lean_name: g.lean_name.clone(),
+                file: g.file.clone(),
+                lead: None,
+                verified_round: None,
+            });
+            if gs.status == "proved" {
+                gs.status = "open".into();
+                gs.verified_round = None;
+            }
+        }
+    })?;
+    Ok(new_plan)
 }
 
 fn slug(s: &str) -> String {
@@ -349,7 +470,8 @@ pub fn plan(eng: &mut Engine, round: u32) -> Result<()> {
         ),
     )
     .section("challenge", challenge_text(&eng.ctx))
-    .section("current_plan", old.as_ref().map(|p| serde_json::to_string_pretty(p).unwrap_or_default()).unwrap_or_default())
+    .section("import_graph", old.as_ref().map(|p| import_graph_text(eng, p)).unwrap_or_default())
+    .section("current_plan", old.as_ref().map(|p| serde_json::to_string_pretty(&plan::with_repairs(p, vec![])).unwrap_or_default()).unwrap_or_default())
     .section("goal_status", st.goals.iter().map(|(k, g)| format!("{k}: {}", g.status)).collect::<Vec<_>>().join("\n"))
     .section("strategy", strategy)
     .section("bulletin", bulletin_tail(&eng.ctx))
@@ -395,8 +517,13 @@ pub struct LeadAssign {
 }
 
 pub fn orchestrate(eng: &mut Engine, round: u32) -> Result<()> {
+    let mut plan = load_plan(&eng.ctx).unwrap_or_else(|| fallback_plan(eng, 1));
+    if !eng.rechecked {
+        recheck_proved(eng, round, &plan)?;
+        eng.rechecked = true;
+    }
+    plan = adopt_orphans(eng, round, plan)?;
     let st = eng.state()?;
-    let plan = load_plan(&eng.ctx).unwrap_or_else(|| fallback_plan(eng, 1));
     let open: BTreeSet<String> = plan
         .goals
         .iter()
@@ -422,6 +549,7 @@ pub fn orchestrate(eng: &mut Engine, round: u32) -> Result<()> {
         format!("Round {round}. Group the open goals into at most {max_leads} leads. Follow the user's guidance if any."),
     )
     .section("goals", goals_listing(eng, &plan, None))
+    .section("import_graph", import_graph_text(eng, &plan))
     .section("lead_summaries", summaries)
     .section("gate_verdicts", verdicts)
     .section("guidance", st.pending_guidance.join("\n\n"))
@@ -537,6 +665,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
     .section("goals", goals_listing(eng, plan, Some(&mine)))
     .section("lead_notes", notes)
     .section("verified_lemmas", verified.clone())
+    .section("import_graph", import_graph_text(eng, plan))
     .section("challenge", if has_target { challenge_text(ctx) } else { String::new() })
     .section("bulletin", bulletin_tail(ctx))
     .label(id);
@@ -606,7 +735,11 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
     let mut asgs: Vec<Asg> = Vec::new();
     for a in lp["assignments"].as_array().into_iter().flatten() {
         let goal = a["goal_id"].as_str().unwrap_or("").to_string();
-        let file = a["file"].as_str().unwrap_or("").to_string();
+        let mut file = a["file"].as_str().unwrap_or("").to_string();
+        // A repair goal is about one file; it is always worked on in place.
+        if let Some(g) = plan.goal(&goal).filter(|g| g.kind == "repair") {
+            file = g.file.clone();
+        }
         if !mine.contains(&goal) || refuted.contains(&goal) || !plan::valid_file(&file) {
             continue;
         }
@@ -649,6 +782,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
                     }
                     let build = |diag: Option<&str>| {
                         let task = match diag {
+                            None if g.kind == "repair" => format!("Repair {} (goal {}): make it build with no errors and no sorry. Edit only that file.", a.file, a.goal),
                             None => format!("Prove goal {} in {}. Edit only that file.", a.goal, a.file),
                             Some(_) => format!("Prove goal {} in {}. Edit only that file. The engine checked the file after your last reply and it does not compile cleanly yet: fix the errors below.", a.goal, a.file),
                         };
@@ -657,6 +791,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
                             .section("instructions", a.instructions.clone())
                             .section("shared", shared.clone())
                             .section("existing_lemmas", a.existing.join("\n"))
+                            .section("import_graph", import_graph_text(eng, plan))
                             .section("challenge", if g.kind == "target" { challenge_text(&eng.ctx) } else { String::new() })
                             .section("file", read_file(&eng.ctx, &a.file))
                             .section("diagnostics", diag.unwrap_or("").to_string())
@@ -763,7 +898,9 @@ pub fn verify(eng: &mut Engine, round: u32) -> Result<()> {
                 .collect();
             // The goal's own name must be among the proved names.
             let goal_name = plan.as_ref().and_then(|p| p.goal(&gid)).map(|g| g.lean_name.clone());
+            let is_repair = plan.as_ref().and_then(|p| p.goal(&gid)).is_some_and(|g| g.kind == "repair");
             let res = match &goal_name {
+                _ if is_repair => check_decls(&eng.ctx, &file, &[]).map(|_| ()),
                 Some(n) if !names.contains(n) => Err(format!("the reply does not list the goal's theorem {n}")),
                 _ => verify_claim(&eng.ctx, &file, &names, &defs),
             };
@@ -866,7 +1003,7 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
     let work: Vec<&Goal> = plan
         .goals
         .iter()
-        .filter(|g| g.kind != "target" && g.file.starts_with("lean/Apc/Proof/Work/") && st.goals.get(&g.id).is_some_and(|x| x.status == "proved"))
+        .filter(|g| matches!(g.kind.as_str(), "lemma" | "witness") && g.file.starts_with("lean/Apc/Proof/Work/") && st.goals.get(&g.id).is_some_and(|x| x.status == "proved"))
         .collect();
     if work.is_empty() {
         return Ok(());

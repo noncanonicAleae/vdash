@@ -1560,3 +1560,16 @@ Gemini owns M8-03..M8-06.
   `vdash kill` / `/kill` and `/verbose [on|off]`.
 - 2026-11-15 (Gemini): dropped the `campaign_path` check in `anchor::verify` (M1-08,
   §3.2) so campaigns can be moved between directories without invalidating the anchor.
+- 2026-11-15 (Claude, building on Gemini's `scan_imports`): `sequent-calculus` was stuck
+  at `build_failed`. Three fixes. (1) Stale proved goals: at the first orchestrate of
+  every engine run (so after `restart`) the engine re-verifies each proved non-target
+  goal with `check_decls` and reopens failures. (2) Import graph: `lean::build` and the
+  gate only reject missing imports inside the target's closure (one dangling file no
+  longer blinds every worker), and the architect, orchestrator, lead and worker
+  prompts get an `<import_graph>` section tagging each module's owning goals, whether
+  Solution reaches it, `ORPHAN` and `[MISSING]`. (3) Orphans: each orchestrate, an
+  `Apc.Proof.*` module reachable from Solution or a goal file that no goal owns and
+  that fails or has sorry (with all its imports fine) gets an engine-created goal of
+  kind `repair` (id `repair_<module>`), pinned to its own file and verified by a clean
+  build; repair goals are hidden from the architect and skipped by integrate. Test:
+  `tests/engine.rs::stale_proved_goals_reopen_and_orphans_become_repair_goals`.

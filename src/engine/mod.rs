@@ -44,11 +44,13 @@ pub struct Engine<'p> {
     pub snap: Option<Snapshot>,
     /// Amendment decisions received from the user, for the amend stage.
     pub decisions: Vec<(u32, bool)>,
+    /// Set once the engine has re-verified every "proved" goal in this run.
+    pub rechecked: bool,
 }
 
 impl<'p> Engine<'p> {
     pub fn new(ctx: Ctx, pool: &'p Pool, opts: Opts, stop: Arc<AtomicBool>) -> Self {
-        Engine { ctx, pool, stop, opts, snap: None, decisions: Vec::new() }
+        Engine { ctx, pool, stop, opts, snap: None, decisions: Vec::new(), rechecked: false }
     }
 
     pub fn state(&self) -> Result<State> {

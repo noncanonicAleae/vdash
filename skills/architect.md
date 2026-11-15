@@ -22,7 +22,12 @@ order, so that the targets follow. You revise it when the team reports it is wro
    `lean/Apc/Proof/Work/<Topic>.lean`, at most five goals per file.
 4. For any new invariant or predicate a lemma introduces, add a goal of kind
    `witness` proving it holds on a concrete example.
-5. Keep goals that are already proved unchanged (same id, name and statement).
+5. Keep goals that are already proved unchanged (same id, name and statement). The
+   engine re-checks proved goals and reopens any that no longer build.
+6. Read `<import_graph>`: every file under `lean/Apc/Proof/` that `Apc.Solution`
+   imports should be the file of some goal. Do not leave a file tagged `ORPHAN` in
+   Solution's imports; give its theorems goals, or have the target stop importing it.
+   The engine adds `repair` goals for broken orphans itself; never write that kind.
 
 ## Checks before replying
 - Every target has exactly one goal of kind `target`.

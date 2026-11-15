@@ -328,30 +328,56 @@ fn compile_single_module(
     })
 }
 
-pub fn build(
-    ctx: &Ctx,
+fn scope_graph_for_targets(
     tree: &Path,
-    build_dir: &Path,
+    scan: imports::ImportScan,
     targets: Option<&[String]>,
-) -> Result<BuildReport> {
-    let full_graph = imports::import_graph(tree)?;
-    let graph = if let Some(ts) = targets {
+) -> Result<BTreeMap<String, Vec<String>>> {
+    if let Some(ts) = targets {
         for t in ts {
-            if !full_graph.contains_key(t) {
+            if !scan.graph.contains_key(t) {
                 return Err(VdashError::new(
                     1,
                     format!("target module '{t}' does not exist in {}", tree.display()),
                 ));
             }
         }
-        let needed = imports::closure_of(&full_graph, ts);
-        full_graph
+        let needed = imports::closure_of(&scan.graph, ts);
+        let missing_msgs: Vec<String> = scan
+            .missing
+            .iter()
+            .filter(|(m, _, _)| needed.contains(m))
+            .map(|(_, dep, rel)| format!("{} imports missing module {dep}", rel.display()))
+            .collect();
+        if !missing_msgs.is_empty() {
+            return Err(VdashError::new(1, missing_msgs.join("\n")));
+        }
+        Ok(scan
+            .graph
             .into_iter()
             .filter(|(k, _)| needed.contains(k))
-            .collect()
+            .collect())
     } else {
-        full_graph
-    };
+        if !scan.missing.is_empty() {
+            let missing_msgs: Vec<String> = scan
+                .missing
+                .iter()
+                .map(|(_, dep, rel)| format!("{} imports missing module {dep}", rel.display()))
+                .collect();
+            return Err(VdashError::new(1, missing_msgs.join("\n")));
+        }
+        Ok(scan.graph)
+    }
+}
+
+pub fn build(
+    ctx: &Ctx,
+    tree: &Path,
+    build_dir: &Path,
+    targets: Option<&[String]>,
+) -> Result<BuildReport> {
+    let scan = imports::scan_imports(tree)?;
+    let graph = scope_graph_for_targets(tree, scan, targets)?;
 
     let levels = imports::topo_levels(&graph)?;
     let tc = lean::toolchain(&ctx.cfg)?;
@@ -540,4 +566,42 @@ pub fn check_file(ctx: &Ctx, file_arg: &Path, cwd: &Path) -> Result<(String, boo
     let mut out = lines.join("\n");
     out.push('\n');
     Ok((out, rep.ok))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn scope_graph_ignores_missing_imports_outside_target_closure() {
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path();
+        fs::create_dir_all(tree.join("Apc/Proof/Work")).unwrap();
+        fs::write(tree.join("Apc/Proof/Work/Good.lean"), "-- clean\n").unwrap();
+        fs::write(
+            tree.join("Apc/Proof/Work/Bad.lean"),
+            "import Apc.Proof.Work.DoesNotExist\n",
+        )
+        .unwrap();
+
+        let scan = imports::scan_imports(tree).unwrap();
+        // Full build still rejects Bad.lean's missing import.
+        let full_err = scope_graph_for_targets(tree, scan.clone(), None).unwrap_err();
+        assert_eq!(full_err.code, 1);
+        assert!(full_err.message.contains("DoesNotExist"));
+
+        // Building Good.lean ignores Bad.lean's missing import completely.
+        let good_graph =
+            scope_graph_for_targets(tree, scan.clone(), Some(&["Apc.Proof.Work.Good".into()]))
+                .unwrap();
+        assert_eq!(good_graph.len(), 1);
+        assert!(good_graph.contains_key("Apc.Proof.Work.Good"));
+
+        // Building Bad.lean reports Bad.lean's own missing import.
+        let bad_err =
+            scope_graph_for_targets(tree, scan, Some(&["Apc.Proof.Work.Bad".into()])).unwrap_err();
+        assert_eq!(bad_err.code, 1);
+        assert!(bad_err.message.contains("DoesNotExist"));
+    }
 }

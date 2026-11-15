@@ -21,7 +21,9 @@ shape is wanted: a **plan** or a **summary**.
 
 ## Procedure
 Plan:
-1. Read the goals, their statements and dependencies, your notes, and the bulletin.
+1. Read the goals, their statements and dependencies, your notes, the bulletin and
+   `<import_graph>` (which goal owns which file, and what each file imports). A goal
+   of kind `repair` is always worked on in its own file.
 2. Put in `refute` every goal not yet attempted whose truth you doubt (falsify first).
 3. Fix shared parameters before work fans out: if two goals need the same helper
    lemma or definition, state it once in `shared` with its exact Lean signature.

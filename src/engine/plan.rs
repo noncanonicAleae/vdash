@@ -96,6 +96,30 @@ pub fn validate(goals: &[Goal], state: &State) -> Vec<String> {
     errs
 }
 
+/// Engine-created goal that makes an orphaned file (one no goal owns) compile again.
+pub const REPAIR_PREFIX: &str = "repair_";
+
+pub fn repair_goal(module: &str, file: &str, parent: &str) -> Goal {
+    Goal {
+        id: format!("{REPAIR_PREFIX}{}", module.replace('.', "_")),
+        kind: "repair".into(),
+        lean_name: module.to_string(),
+        statement: format!(
+            "(repair) {file} is imported by the solution but is owned by no goal and does not build cleanly. Make it compile with no errors and no sorry. Keep the statements other modules use."
+        ),
+        file: file.to_string(),
+        depends_on: vec![],
+        parent_target: parent.to_string(),
+    }
+}
+
+/// `plan` with its repair goals replaced by `repairs`.
+pub fn with_repairs(plan: &Plan, repairs: Vec<Goal>) -> Plan {
+    let mut goals: Vec<Goal> = plan.goals.iter().filter(|g| g.kind != "repair").cloned().collect();
+    goals.extend(repairs);
+    Plan { goals, ..plan.clone() }
+}
+
 /// Merge a new plan into the state's goals: new goals start open, removed goals are
 /// dropped, proved goals keep their status if name and statement are unchanged.
 pub fn merge_into_state(old: Option<&Plan>, new: &Plan, state: &mut State) {

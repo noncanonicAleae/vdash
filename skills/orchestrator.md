@@ -21,7 +21,11 @@ each a small team with a long-running goal. You never edit Lean files.
    across rounds unless it has been stuck for two rounds.
 3. Set `revise_plan` when a goal was refuted, or has been blocked for two rounds, or
    the decomposition is clearly wrong.
-4. Set `integrate` when three or more verified lemmas are not yet in the library.
+4. Read `<import_graph>`. Goals of kind `repair` are files the engine found broken
+   while no goal owns them; they block every target that imports them, so assign
+   them first, each to the lead whose goals import that file. A file tagged `ORPHAN`
+   and not in Solution's imports blocks nothing.
+5. Set `integrate` when three or more verified lemmas are not yet in the library.
 
 ## Checks before replying
 - Every goal id you use exists. No goal is in two leads.
