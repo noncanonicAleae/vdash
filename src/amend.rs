@@ -63,6 +63,19 @@ pub struct AmendmentRecord {
     pub touches_trusted_assumptions: bool,
     pub closer_to_code: bool,
     pub critic_reason: String,
+    /// Set when a human applied an escalated proposal with `--accept-weakening`:
+    /// the spec was knowingly weakened to match the code (DESIGN §10).
+    #[serde(default)]
+    pub weakening_accepted: bool,
+}
+
+/// A human's decision on an amendment, from the CLI, the app or the engine inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Approve,
+    /// Approve an escalated proposal, knowingly accepting a weaker guarantee.
+    AcceptWeakening,
+    Reject,
 }
 
 impl AmendmentRecord {
@@ -86,6 +99,9 @@ impl AmendmentRecord {
         ));
         md.push_str(&format!("- **Closer to code**: `{}`\n", self.closer_to_code));
         md.push_str(&format!("- **Approved by**: `{}`\n", self.approved_by));
+        if self.weakening_accepted {
+            md.push_str("- **Weakening accepted**: `true` (an escalated proposal the human applied knowingly)\n");
+        }
         md.push_str(&format!("- **File**: `{}`\n\n", self.file));
         md.push_str("## Justification\n\n");
         md.push_str(self.justification.trim());
@@ -304,6 +320,7 @@ pub fn propose(
         touches_trusted_assumptions: false,
         closer_to_code: false,
         critic_reason: String::new(),
+        weakening_accepted: false,
     };
 
     // Early rejections without calling the critic:
@@ -460,7 +477,7 @@ pub fn propose(
             rec.status = "pending".to_string();
             save_record(ctx, &rec)?;
             if auto_apply {
-                match apply(ctx, n, "auto_neutral") {
+                match apply(ctx, n, "auto_neutral", false) {
                     Ok(()) => {
                         let applied_rec = load_record(ctx, n)?;
                         Ok((applied_rec, true))
@@ -505,17 +522,16 @@ pub fn propose(
 
 /// Apply an amendment to the work tree and `.heldout/`, verify the build, extend the
 /// anchor, reset targets and affected goals, and commit (M6-03).
-pub fn apply(ctx: &Ctx, n: u32, approved_by: &str) -> Result<()> {
-    let problems = anchor::verify(ctx);
-    if !problems.is_empty() {
-        return Err(VdashError::new(
-            3,
-            format!("anchor verification failed: {}", problems.join("; ")),
-        ));
-    }
-
+///
+/// An `escalated` record (the critic judged it a guarantee-weakening change, so a
+/// potential bug) is applied only with `accept_weakening`, and is then marked so.
+pub fn apply(ctx: &Ctx, n: u32, approved_by: &str, accept_weakening: bool) -> Result<()> {
     let mut rec = load_record(ctx, n)?;
-    // A human may also approve an escalated proposal: escalation hands them the decision.
+    // A human may also apply an escalated proposal, but only by explicitly accepting
+    // the weaker guarantee (DESIGN §10).
+    if rec.status == "escalated" && !accept_weakening {
+        return Err(escalated_needs_flag(&rec));
+    }
     if !matches!(rec.status.as_str(), "pending" | "approved" | "escalated") {
         return Err(VdashError::new(
             2,
@@ -523,6 +539,14 @@ pub fn apply(ctx: &Ctx, n: u32, approved_by: &str) -> Result<()> {
                 "amendment {:03} cannot be applied (status is '{}', expected 'pending')",
                 n, rec.status
             ),
+        ));
+    }
+
+    let problems = anchor::verify(ctx);
+    if !problems.is_empty() {
+        return Err(VdashError::new(
+            3,
+            format!("anchor verification failed: {}", problems.join("; ")),
         ));
     }
 
@@ -617,6 +641,7 @@ pub fn apply(ctx: &Ctx, n: u32, approved_by: &str) -> Result<()> {
     }
 
     // Update record on disk before anchor::extend hashes it
+    rec.weakening_accepted = rec.status == "escalated";
     rec.status = "applied".to_string();
     rec.approved_by = approved_by.to_string();
     save_record(ctx, &rec)?;
@@ -674,7 +699,7 @@ pub fn process(
     pool: &Pool,
     round: u32,
     proposals: Vec<Value>,
-    decisions: Vec<(u32, bool)>,
+    decisions: Vec<(u32, Decision)>,
 ) -> Result<AmendOutcome> {
     let mut applied = Vec::new();
 
@@ -685,15 +710,15 @@ pub fn process(
         }
     }
 
-    for (n, approve) in decisions {
+    for (n, decision) in decisions {
         let Ok(mut rec) = load_record(ctx, n) else {
             continue;
         };
         if rec.status != "pending" && rec.status != "escalated" {
             continue;
         }
-        if approve {
-            if apply(ctx, n, "user").is_ok() {
+        if decision != Decision::Reject {
+            if apply(ctx, n, "user", decision == Decision::AcceptWeakening).is_ok() {
                 applied.push(n);
             }
         } else {
@@ -712,8 +737,22 @@ pub fn process(
     Ok(AmendOutcome { applied })
 }
 
-/// CLI `vdash amend approve <N>` (M6-03).
-pub fn approve_cmd(ctx: &Ctx, n: u32) -> Result<String> {
+fn escalated_needs_flag(rec: &AmendmentRecord) -> VdashError {
+    VdashError::new(
+        2,
+        format!(
+            "amendment {n:03} was escalated: the critic judged that it weakens the guarantee to match the code, \
+             so it may be a bug in the code. Read {path}. To apply it anyway and accept the weaker guarantee, \
+             run `vdash amend approve {n} --accept-weakening`; to dismiss it, `vdash amend reject {n}`",
+            n = rec.n,
+            path = rec.escalation_rel_path()
+        ),
+    )
+}
+
+/// CLI `vdash amend approve <N> [--accept-weakening]` (M6-03). An escalated proposal
+/// needs `--accept-weakening`; the flag is refused on anything else.
+pub fn approve_cmd(ctx: &Ctx, n: u32, accept_weakening: bool) -> Result<String> {
     let rec = load_record(ctx, n)?;
     if rec.status != "pending" && rec.status != "escalated" {
         return Err(VdashError::new(
@@ -724,32 +763,42 @@ pub fn approve_cmd(ctx: &Ctx, n: u32) -> Result<String> {
             ),
         ));
     }
+    if rec.status == "escalated" && !accept_weakening {
+        return Err(escalated_needs_flag(&rec));
+    }
+    if rec.status != "escalated" && accept_weakening {
+        return Err(VdashError::new(
+            2,
+            format!("amendment {n:03} is '{}', not escalated; approve it without --accept-weakening", rec.status),
+        ));
+    }
     if events::engine_running(ctx).is_some() {
-        events::send(ctx, &Control::AmendDecision { n, approve: true })?;
+        events::send(ctx, &Control::AmendDecision { n, approve: true, accept_weakening })?;
         Ok(format!(
             "vdash: approval for amendment {:03} queued for the running engine\n",
             n
         ))
     } else {
-        apply(ctx, n, "user")?;
-        Ok(format!("vdash: amendment {:03} ({}) applied\n", n, rec.slug))
+        apply(ctx, n, "user", accept_weakening)?;
+        let note = if accept_weakening { " (weaker guarantee accepted)" } else { "" };
+        Ok(format!("vdash: amendment {:03} ({}) applied{note}\n", n, rec.slug))
     }
 }
 
 /// CLI `vdash amend reject <N>` (M6-03).
 pub fn reject_cmd(ctx: &Ctx, n: u32) -> Result<String> {
     let mut rec = load_record(ctx, n)?;
-    if rec.status != "pending" {
+    if rec.status != "pending" && rec.status != "escalated" {
         return Err(VdashError::new(
             2,
             format!(
-                "amendment {:03} is '{}' (only 'pending' amendments can be rejected)",
+                "amendment {:03} is '{}' (only pending or escalated amendments can be rejected)",
                 n, rec.status
             ),
         ));
     }
     if events::engine_running(ctx).is_some() {
-        events::send(ctx, &Control::AmendDecision { n, approve: false })?;
+        events::send(ctx, &Control::AmendDecision { n, approve: false, accept_weakening: false })?;
         Ok(format!(
             "vdash: rejection for amendment {:03} queued for the running engine\n",
             n
@@ -812,8 +861,9 @@ pub fn list_cmd(ctx: &Ctx) -> Result<String> {
     let mut out = String::new();
     for r in records {
         let first_line = r.justification.lines().next().unwrap_or("").trim();
+        let flag = if r.weakening_accepted { "[WEAKENING ACCEPTED] " } else { "" };
         out.push_str(&format!(
-            "{:03}  {:<10}  {:<28}  verdict={:<8}  by={:<12}  {}\n",
+            "{:03}  {:<10}  {:<28}  verdict={:<8}  by={:<12}  {flag}{}\n",
             r.n, r.status, r.file, r.critic_verdict, r.approved_by, first_line
         ));
     }

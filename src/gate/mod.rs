@@ -262,33 +262,14 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
     let sol_fps = fingerprint::closure(ctx, &sol_tree, &sol_build, "Apc.Solution", &target_names)?;
 
     // Step 7 check (optional comparator_cmd)
-    let comparator_failed = if !ctx.cfg.policy.comparator_cmd.trim().is_empty() {
-        let parts: Vec<&str> = ctx
-            .cfg
-            .policy
-            .comparator_cmd
-            .split_whitespace()
-            .collect();
-        if parts.is_empty() {
-            false
-        } else {
-            let mut ccmd = Command::new(parts[0]);
-            ccmd.args(&parts[1..])
-                .arg(&chal_build)
-                .arg(&sol_build)
-                .current_dir(&ctx.campaign.root);
-            match proc::run(
-                &mut ccmd,
-                None,
-                Duration::from_secs(ctx.cfg.budget.lean_timeout_s),
-            ) {
-                Ok(out) => out.timed_out || out.status != Some(0),
-                Err(_) => true,
-            }
-        }
-    } else {
-        false
-    };
+    let comparator_err = run_comparator(
+        ctx,
+        &chal_build,
+        &sol_build,
+        &chal_tree,
+        &sol_tree,
+        &target_names,
+    );
 
     // Step 6: Per-target comparison
     let mut targets_out = BTreeMap::new();
@@ -368,8 +349,9 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
             }
         }
 
-        if comparator_failed {
+        if let Some(ref err) = comparator_err {
             reasons.push(ReasonCode::ComparatorDisagrees);
+            detail.insert("comparator".to_string(), serde_json::json!(err));
         }
 
         let accepted = reasons.is_empty();
@@ -391,6 +373,96 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
         global_reasons: Vec::new(),
         targets: targets_out,
     })
+}
+
+/// Run an optional external `policy.comparator_cmd` against the built challenge
+/// and solution trees.
+///
+/// Positional arguments: `<chal_build> <sol_build>`.
+/// Environment variables passed to the comparator process:
+/// - `VDASH_CHALLENGE_BUILD`: built challenge `.olean` directory
+/// - `VDASH_SOLUTION_BUILD`: built solution `.olean` directory
+/// - `VDASH_CHALLENGE_TREE`: challenge source tree (`.heldout/lean/`)
+/// - `VDASH_SOLUTION_TREE`: solution source tree (`lean/`)
+/// - `VDASH_TARGETS`: comma-separated target Lean declaration names
+/// - `ELAN_TOOLCHAIN`: configured Lean toolchain (when resolvable)
+/// - `VDASH_HOST_LEAN_PATH`: host package/Mathlib `LEAN_PATH` entries when
+///   `use_mathlib = true` (without the solution build dir prefix)
+///
+/// Returns `Some(diagnostic)` if the command fails, times out, or cannot spawn;
+/// `None` if no comparator is configured or it exits 0.
+fn run_comparator(
+    ctx: &Ctx,
+    chal_build: &Path,
+    sol_build: &Path,
+    chal_tree: &Path,
+    sol_tree: &Path,
+    target_names: &[String],
+) -> Option<String> {
+    let cmd_str = ctx.cfg.policy.comparator_cmd.trim();
+    if cmd_str.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut ccmd = Command::new(parts[0]);
+    ccmd.args(&parts[1..])
+        .arg(chal_build)
+        .arg(sol_build)
+        .env("VDASH_CHALLENGE_BUILD", chal_build)
+        .env("VDASH_SOLUTION_BUILD", sol_build)
+        .env("VDASH_CHALLENGE_TREE", chal_tree)
+        .env("VDASH_SOLUTION_TREE", sol_tree)
+        .env("VDASH_TARGETS", target_names.join(","))
+        .current_dir(&ctx.campaign.root);
+
+    if let Ok(tc) = lean::toolchain(&ctx.cfg) {
+        ccmd.env("ELAN_TOOLCHAIN", tc);
+    }
+    if ctx.cfg.use_mathlib {
+        if let Ok(lp) = lean::lean_path(ctx, sol_build) {
+            let prefix = format!("{}:", sol_build.display());
+            if let Some(host_lp) = lp.strip_prefix(&prefix) {
+                if !host_lp.is_empty() {
+                    ccmd.env("VDASH_HOST_LEAN_PATH", host_lp);
+                }
+            }
+        }
+    }
+
+    match proc::run(
+        &mut ccmd,
+        None,
+        Duration::from_secs(ctx.cfg.budget.lean_timeout_s),
+    ) {
+        Ok(out) if !out.timed_out && out.status == Some(0) => None,
+        Ok(out) if out.timed_out => Some(format!(
+            "comparator timed out after {}s",
+            ctx.cfg.budget.lean_timeout_s
+        )),
+        Ok(out) => {
+            let stderr = out.stderr_lossy();
+            let stdout = out.stdout_lossy();
+            let msg = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            let code = out
+                .status
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            if msg.is_empty() {
+                Some(format!("comparator exited with status {code}"))
+            } else {
+                Some(format!("comparator exited with status {code}: {msg}"))
+            }
+        }
+        Err(e) => Some(format!("comparator failed to run: {e}")),
+    }
 }
 
 pub fn update_state_from_verdict(ctx: &Ctx, verdict: &Verdict) -> Result<()> {
@@ -452,4 +524,110 @@ pub fn gate_cmd(ctx: &Ctx, json: bool) -> Result<(String, u8)> {
         1
     };
     Ok((out, code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendKind;
+    use crate::jsonio;
+    use crate::paths;
+
+    fn mk_gate_ctx(tmp: &TempDir) -> (Ctx, PathBuf, PathBuf, PathBuf, PathBuf, Vec<String>) {
+        let host = tmp.path().join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("lean-toolchain"), "leanprover/lean4:v4.33.0\n").unwrap();
+
+        let camp = tmp.path().join("camp");
+        paths::init_campaign(&camp, &host, None, &[BackendKind::Claude]).unwrap();
+        let ctx = Ctx::for_test(&camp, tmp.path().join("state")).unwrap();
+
+        let chal_build = camp.join(".heldout/build");
+        let sol_build = camp.join(".build");
+        let chal_tree = camp.join(".heldout/lean");
+        let sol_tree = camp.join("lean");
+        let targets = vec!["Apc.TargetOne".to_string(), "Apc.TargetTwo".to_string()];
+        (ctx, chal_build, sol_build, chal_tree, sol_tree, targets)
+    }
+
+    #[test]
+    fn comparator_empty_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let (ctx, cb, sb, ct, st, targets) = mk_gate_ctx(&tmp);
+        assert_eq!(run_comparator(&ctx, &cb, &sb, &ct, &st, &targets), None);
+    }
+
+    #[test]
+    fn comparator_passes_args_and_env_and_accepts_zero() {
+        let tmp = TempDir::new().unwrap();
+        let (mut ctx, cb, sb, ct, st, targets) = mk_gate_ctx(&tmp);
+        ctx.cfg.use_mathlib = true;
+
+        // Pre-populate the host lean_path cache so lean::lean_path does not invoke `lake`.
+        jsonio::write_atomic(
+            ctx.campaign.lean_path_cache(),
+            &serde_json::json!({
+                "version": 1,
+                "host_project": ctx.cfg.host_project.display().to_string(),
+                "manifest_mtime_ns": 0,
+                "lean_path": "/opt/mathlib/lib/lean",
+            }),
+        )
+        .unwrap();
+
+        let dump = tmp.path().join("env_dump.txt");
+        let script = tmp.path().join("cmp_ok.sh");
+        fs::write(
+            &script,
+            format!(
+                "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \
+                 \"$1\" \"$2\" \"$ELAN_TOOLCHAIN\" \"$VDASH_CHALLENGE_BUILD\" \
+                 \"$VDASH_SOLUTION_BUILD\" \"$VDASH_CHALLENGE_TREE\" \"$VDASH_SOLUTION_TREE\" \
+                 \"$VDASH_TARGETS\" \"$VDASH_HOST_LEAN_PATH\" > {}\n",
+                dump.display()
+            ),
+        )
+        .unwrap();
+        ctx.cfg.policy.comparator_cmd = format!("sh {}", script.display());
+
+        let err = run_comparator(&ctx, &cb, &sb, &ct, &st, &targets);
+        assert_eq!(err, None);
+
+        let lines: Vec<String> = fs::read_to_string(&dump)
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                cb.display().to_string(),
+                sb.display().to_string(),
+                "leanprover/lean4:v4.33.0".to_string(),
+                cb.display().to_string(),
+                sb.display().to_string(),
+                ct.display().to_string(),
+                st.display().to_string(),
+                "Apc.TargetOne,Apc.TargetTwo".to_string(),
+                "/opt/mathlib/lib/lean".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn comparator_reports_nonzero_and_missing_binary() {
+        let tmp = TempDir::new().unwrap();
+        let (mut ctx, cb, sb, ct, st, targets) = mk_gate_ctx(&tmp);
+
+        let script = tmp.path().join("cmp_fail.sh");
+        fs::write(&script, "echo 'mismatch on Apc.TargetOne' >&2\nexit 3\n").unwrap();
+        ctx.cfg.policy.comparator_cmd = format!("sh {}", script.display());
+        let err = run_comparator(&ctx, &cb, &sb, &ct, &st, &targets).unwrap();
+        assert!(err.contains("status 3"), "got: {err}");
+        assert!(err.contains("mismatch on Apc.TargetOne"), "got: {err}");
+
+        ctx.cfg.policy.comparator_cmd = "nonexistent-vdash-comparator-bin".to_string();
+        let err2 = run_comparator(&ctx, &cb, &sb, &ct, &st, &targets).unwrap();
+        assert!(err2.contains("comparator failed to run"), "got: {err2}");
+    }
 }

@@ -238,7 +238,11 @@ It sees file paths and theorem names only.
      `sorry` (`sorryAx`) and `native_decide`; step 2 is belt and braces.
 4. A target is **accepted** iff the closure maps are identical, it is a theorem, and
    its axioms are standard. Per-target verdicts go to `state.json`; commit.
-5. If `comparator_cmd` is set, run it too and require agreement.
+5. If `comparator_cmd` is set, run it too with positional args `<chal_build> <sol_build>`
+   and env vars `VDASH_CHALLENGE_BUILD`, `VDASH_SOLUTION_BUILD`,
+   `VDASH_CHALLENGE_TREE`, `VDASH_SOLUTION_TREE`, `VDASH_TARGETS`,
+   `ELAN_TOOLCHAIN`, and (when `use_mathlib = true`) `VDASH_HOST_LEAN_PATH`;
+   require exit 0 (failures set `comparator_disagrees` and `detail.comparator`).
 
 `vdash axioms <file> <Name>...` (same script, existence + axiom check only) verifies
 lemma-level claims before a goal's status becomes `proved`.
@@ -301,7 +305,13 @@ exact-replace edit (`old_text` must occur once), not a diff.
    Verdict: `accept | reject | escalate`, plus `touches_trusted_assumptions`.
 3. **Escalate**: a proposal that would weaken the guarantee to match the code is never
    an amendment. It is written to `escalations/` as a potential bug for the human; the
-   campaign continues on other goals.
+   campaign continues on other goals. The human fixes the code or the spec out of band,
+   dismisses it (`vdash amend reject N`), or knowingly accepts the weaker guarantee with
+   `vdash amend approve N --accept-weakening` (`/amend approve N --accept-weakening`).
+   Plain `approve` refuses an escalated proposal, and the flag is refused on anything
+   else. An accepted weakening is applied like an amendment but recorded with
+   `weakening_accepted = true`, which the record and `vdash amend list` show
+   (`[WEAKENING ACCEPTED]`). `auto_neutral` never applies one.
 4. Approval: `amendment_policy = "manual"` (default): the user approves or rejects
    (`vdash amend approve N`, or `/amend` in the app). `"auto_neutral"`: auto-apply when
    the verdict is accept and trusted assumptions are untouched; everything else waits.
@@ -414,3 +424,39 @@ comparator_cmd = ""
   with no shell. The control inbox in the state directory is not signed; with the
   sandbox, agents can no longer reach it.
 - Scale is a handful of agents; subscription rate limits are the binding constraint.
+
+## 16. Second design-review pass (2026-11-16)
+Reviewed the codebase (`src/approve.rs`, `src/amend.rs`, `src/config.rs`, `src/gate/`,
+`src/lean/`, `src/engine/`) against `docs/references/alphaproof_code_signal.txt`.
+
+Core alignment holds: heldout spec vs. agent work tree separation, hash-chained trust
+anchor, AST/DAG closure fingerprinting + standard-axiom check in `gate`, structured
+`architect` → `orchestrator` → `lead` → `falsifier`/`worker` → `integrator` loop with
+`Proof/Work` vs. `Proof/Lib`, witness checks on new definitions, and spec-only `critic`
+context.
+
+Findings and divergences observed:
+- **Escalation approval (`src/amend.rs`)**: `vdash amend approve` applied a
+  critic-`escalate` proposal like any pending amendment, whereas §10 (and paper §2.3 /
+  §7) say a guarantee-weakening escalation is never an amendment. Resolved with the
+  user (2026-11-16): applying one needs `--accept-weakening` and is recorded as a
+  human-accepted weakening (§10 step 3).
+- **Engine recovery beyond the paper (`src/engine/`, `src/approve.rs`)**: structured
+  output `repair` retries, `stale` / exhausted-goal handling, `vdash restart`, and
+  engine-side `run_worker_checked` rebuild/retry loops (up to two diagnostic retries for
+  sandboxed `agy --sandbox` workers).
+- **`approve` checks (`src/approve.rs`)**: warns on `theorem` in `Spec/` and on
+  stale/incomplete `spec-review.json` rather than blocking, as specified in M1-09.
+- **Fixes landed in this pass**:
+  - Updated `state.module_times` during proof rounds (`file_status`, `check_decls`,
+    `adopt_orphans`, `integrate`) while ignoring cached `0.0s` rebuilds and pruning
+    deleted modules, so `slow_modules` is populated for `orchestrator`/`integrator`.
+  - Validated `campaign.toml`'s `package = "Apc"` at load time to match hardcoded `Apc`
+    assumptions in `Fingerprint.lean`, `gate`, `paths`, and skill prompts.
+  - Keyed `LeanPathCache` by `host_project` in addition to manifest mtime for
+    `use_mathlib = true` campaigns.
+  - Enriched `policy.comparator_cmd` with `VDASH_*`, `ELAN_TOOLCHAIN`, and
+    `VDASH_HOST_LEAN_PATH` env vars plus stderr/status diagnostics in `detail.comparator`.
+- **Remaining M7 gaps**: `comparator` (`landrun` + `lean4export`) is absent on this
+  host, and no VibeMath campaign (`use_mathlib = true`) has completed end-to-end (an
+  exploratory Mathlib campaign, `quartic-query-separation`, reached 2/5 targets on round 5).

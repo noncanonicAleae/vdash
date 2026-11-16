@@ -170,7 +170,8 @@ Run `vdash` with no subcommand inside a campaign to open the terminal UI.
 | `/gate` | Run the deterministic gatekeeper immediately |
 | `/tcb` | Display the Trusted Computing Base (every target's transitive definition closure) |
 | `/amend` | List proposed specification amendments and their Critic verdicts |
-| `/amend approve <N>` / `reject <N>` | Apply or reject pending/escalated amendment `#N` |
+| `/amend approve <N>` / `reject <N>` | Apply or reject pending amendment `#N`; `reject` also dismisses an escalation |
+| `/amend approve <N> --accept-weakening` | Apply an escalated proposal, knowingly accepting a weaker guarantee |
 | `/amend propose <file.json>` | Submit an amendment JSON proposal to the Critic |
 | `/agents` | List agents currently running with elapsed times |
 | `/logs <agent-id>` | Inspect one agent's full JSON reply, cost, and transcript path (e.g. `/logs worker-3`) |
@@ -334,7 +335,7 @@ vdash [-C <DIR>] prove [--rounds <N>] [--single] [--detach]
 vdash [-C <DIR>] status
 vdash [-C <DIR>] pause | resume | stop | kill
 vdash [-C <DIR>] btw "<QUESTION>"
-vdash [-C <DIR>] amend list | approve <N> | reject <N> | propose <FILE.json>
+vdash [-C <DIR>] amend list | approve <N> [--accept-weakening] | reject <N> | propose <FILE.json>
 ```
 
 ### Exit Codes
@@ -386,4 +387,4 @@ vdash [-C <DIR>] amend list | approve <N> | reject <N> | propose <FILE.json>
 - Vdash is an independent reimplementation. DeepMind released only the Lean artifacts ([google-deepmind/code-verification](https://github.com/google-deepmind/code-verification)), not the agent framework; the design here follows the paper's description. The paper itself is not redistributed in this repository: fetch it from its official source and, if you want `docs/PAPER_NOTES.md` references to resolve, save the text as `docs/references/alphaproof_code_signal.txt` (git-ignored).
 - Design and decisions: [`docs/DESIGN.md`](docs/DESIGN.md). Implementation spec and status log: [`docs/ROADMAP.md`](docs/ROADMAP.md). Architecture diagrams: [`docs/architecture.html`](docs/architecture.html).
 - Run the tests with `cargo test` (the Lean-backed suites need a host project: set `VDASH_TEST_HOST` to it, or `APC_SKIP_LEAN=1` to skip them).
-- No license has been chosen yet; until one is added, all rights are reserved.
+- Licensed under the [MIT License](LICENSE).

@@ -320,7 +320,7 @@ when stdout is not a terminal.
 | `status` | M3-08 | plain-text summary |
 | `pause` / `resume` / `stop` | M3-07 | control messages to a running engine |
 | `spec draft` / `spec revise "<text>"` | M5-02 | spec phase |
-| `amend list` / `approve N` / `reject N` | M6-03 | amendments |
+| `amend list` / `approve N [--accept-weakening]` / `reject N` | M6-03 | amendments |
 | `btw "<question>"` | M4-06 | side question to the monitor agent |
 
 A command whose card is not done prints `vdash: error: '<cmd>' is not implemented yet
@@ -1371,13 +1371,16 @@ agent and between stages), acts, and moves each to `inbox/done/`.
     contains no file from `Proof/` or `Solution.lean`.
 
 - [x] **M6-03 `amend::apply`, `vdash amend list|approve|reject`, `/amend`**
-  - `apply(ctx, n, approved_by)`: verify the anchor; apply the exact-replace edit to
+  - `apply(ctx, n, approved_by, accept_weakening)`: an `escalated` record needs
+    `accept_weakening` (then `weakening_accepted = true`, DESIGN §10); verify the anchor; apply the exact-replace edit to
     the work tree file and to the `.heldout/` copy (temporarily restoring write
     permission); build the trusted tree, and roll both back if it fails;
     `anchor::extend`; mark every target unaccepted and every goal whose closure
     includes the edited file `open`; commit `amend: NNN <slug>`.
   - `approve`/`reject`: with an engine running, send `amend_decision`; otherwise
-    apply directly. A number that is not `pending` → code 2.
+    apply directly. A number that is not `pending` or `escalated` → code 2. `approve`
+    of an escalated record without `--accept-weakening`, or with it on any other
+    record → code 2.
   - `list`: number, status, file, verdict, approver, first line of justification.
   - Tests (Lean): after applying, `anchor::verify` is clean and the gate accepts a
     solution written against the amended spec; a solution written against the old
@@ -1389,9 +1392,16 @@ agent and between stages), acts, and moves each to `inbox/done/`.
 ---
 
 ## M7. Later
-- [ ] `comparator` integration behind `comparator_cmd` (needs `landrun`, `lean4export`).
-- [ ] A VibeMath problem as a campaign (`use_mathlib = true`).
-- [ ] Second design-review pass against the paper (agreed with the user).
+- [ ] `comparator` integration behind `comparator_cmd` (contract & tests landed:
+  positional `<chal_build> <sol_build>`, env vars `VDASH_CHALLENGE_BUILD`,
+  `VDASH_SOLUTION_BUILD`, `VDASH_CHALLENGE_TREE`, `VDASH_SOLUTION_TREE`,
+  `VDASH_TARGETS`, `ELAN_TOOLCHAIN`, `VDASH_HOST_LEAN_PATH`, and `detail.comparator`
+  diagnostics; still needs external `comparator` / `landrun` / `lean4export` on host).
+- [ ] A VibeMath problem as a campaign (`use_mathlib = true`; `LeanPathCache` now keyed
+  by `host_project`; `quartic-query-separation` exercised `use_mathlib = true` to 2/5
+  targets on round 5, dedicated VibeMath run still open).
+- [x] Second design-review pass against the paper (agreed with the user). Documented
+  in `DESIGN.md` §16.
 
 ## M8. Vdash: branding, sign-in, models, search (user request 2026-11-14)
 Split on the board (2026-11-14 09:28/09:29): Claude owns M8-01, M8-02 and the docs;
@@ -1603,3 +1613,17 @@ Gemini owns M8-03..M8-06.
   through the grace period and SIGSTOPs the engine before the final sweep. Also fixed
   a regression from the stale-goal change: a fresh lemma whose `parent_target` is
   unaccepted counts as needed (it was retired before any edge reached it).
+- 2026-11-16 (Gemini): Completed second design-review pass against
+  `docs/references/alphaproof_code_signal.txt` (`DESIGN.md` §16) and M7 hardening:
+  populated `state.module_times` on uncached Lean builds during proof rounds so
+  `slow_modules` reaches `orchestrator`/`integrator`, enforced `package = "Apc"` in
+  `config::load`, keyed `LeanPathCache` by `host_project`, and expanded
+  `policy.comparator_cmd` with `VDASH_*`/`ELAN_TOOLCHAIN`/`VDASH_HOST_LEAN_PATH` env
+  vars and `detail.comparator` failure diagnostics (`comparator` / `landrun` /
+  `lean4export` remain external/not installed on host; VibeMath campaign run still open).
+- 2026-11-16 (Claude): Reviewed Gemini's M7 changes; fixed `lean_path_cache_respects_host_project_and_mtime`
+  (it assumed `lake` is absent). Resolved the §16 escalation finding with the user: an
+  escalated proposal applies only with `vdash amend approve N --accept-weakening` (or
+  `/amend approve N --accept-weakening`), is recorded `weakening_accepted`, and is
+  flagged in `amend list`; `reject` now also dismisses escalations. Tests in
+  `tests/amend.rs` (both suites) and `tui::commands`.

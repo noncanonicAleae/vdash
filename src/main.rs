@@ -155,6 +155,9 @@ enum AmendAction {
     /// Approve an amendment
     Approve {
         n: u32,
+        /// Required to apply an escalated proposal: accept that it weakens the guarantee
+        #[arg(long)]
+        accept_weakening: bool,
     },
     /// Reject an amendment
     Reject {
@@ -433,7 +436,7 @@ fn run(cli: Cli) -> Result<()> {
             let (ctx, _) = build_ctx(cli.campaign_dir.as_deref())?;
             let out = match action {
                 AmendAction::List => vdash::amend::list_cmd(&ctx)?,
-                AmendAction::Approve { n } => vdash::amend::approve_cmd(&ctx, n)?,
+                AmendAction::Approve { n, accept_weakening } => vdash::amend::approve_cmd(&ctx, n, accept_weakening)?,
                 AmendAction::Reject { n } => vdash::amend::reject_cmd(&ctx, n)?,
                 AmendAction::Propose { file } => {
                     let pool = vdash::backend::pool::Pool::from_config(&ctx);

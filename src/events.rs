@@ -162,7 +162,13 @@ pub enum Control {
     Stop,
     SetRole { role: String, entries: Vec<String> },
     Guidance { text: String },
-    AmendDecision { n: u32, approve: bool },
+    AmendDecision {
+        n: u32,
+        approve: bool,
+        /// Approve an escalated proposal, accepting the weaker guarantee.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accept_weakening: bool,
+    },
 }
 
 fn inbox_dir(ctx: &Ctx) -> PathBuf {

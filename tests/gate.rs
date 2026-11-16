@@ -333,8 +333,44 @@ end Apc
     }
     fs::remove_file(&evil_spec).unwrap();
 
-    // (e) .heldout/ edited -> exit 3, anchor_mismatch
+    // (e0) comparator_cmd agrees vs disagrees -> comparator_disagrees with detail
     fs::write(&sol_path, ref_sol).unwrap();
+    let cfg_path = camp.config_file();
+    let orig_cfg = fs::read_to_string(&cfg_path).unwrap();
+    let with_cmp = |cmd: &str| {
+        if orig_cfg.contains("comparator_cmd = \"\"") {
+            orig_cfg.replace(
+                "comparator_cmd = \"\"",
+                &format!("comparator_cmd = \"{cmd}\""),
+            )
+        } else {
+            format!("{orig_cfg}\n[policy]\ncomparator_cmd = \"{cmd}\"\n")
+        }
+    };
+    fs::write(&cfg_path, with_cmp("true")).unwrap();
+    let assert_cmp_ok = assert_cmd::Command::new(apc_bin)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["-C", camp_dir.to_str().unwrap(), "gate", "--json"])
+        .assert()
+        .code(0);
+    let v_cmp_ok: Verdict = serde_json::from_slice(&assert_cmp_ok.get_output().stdout).unwrap();
+    assert!(v_cmp_ok.ok);
+
+    fs::write(&cfg_path, with_cmp("false")).unwrap();
+    let assert_cmp_fail = assert_cmd::Command::new(apc_bin)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["-C", camp_dir.to_str().unwrap(), "gate", "--json"])
+        .assert()
+        .code(1);
+    let v_cmp_fail: Verdict = serde_json::from_slice(&assert_cmp_fail.get_output().stdout).unwrap();
+    assert!(!v_cmp_fail.ok);
+    for tv in v_cmp_fail.targets.values() {
+        assert_eq!(tv.reasons, vec![ReasonCode::ComparatorDisagrees]);
+        assert!(tv.detail.get("comparator").is_some());
+    }
+    fs::write(&cfg_path, &orig_cfg).unwrap();
+
+    // (e) .heldout/ edited -> exit 3, anchor_mismatch
     let held_impl = camp.heldout_dir().join("lean/Apc/Spec/Impl.lean");
     util::set_readonly(&held_impl, false).unwrap();
     fs::write(&held_impl, "-- tampered heldout\n").unwrap();

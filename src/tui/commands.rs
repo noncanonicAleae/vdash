@@ -28,6 +28,8 @@ pub enum Cmd {
     Gate,
     Tcb,
     Amend(Option<(bool, u32)>),
+    /// `/amend approve N --accept-weakening`: apply an escalated proposal.
+    AmendAcceptWeakening(u32),
     AmendPropose(String),
     Agents,
     Logs(String),
@@ -58,7 +60,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("verbose", "[on|off]", "toggle (or set) showing proofs as agents write them"),
     ("gate", "", "run the gatekeeper now"),
     ("tcb", "", "show what a reader must trust"),
-    ("amend", "[approve N | reject N | propose <file>]", "list, decide or propose spec amendments"),
+    ("amend", "[approve N [--accept-weakening] | reject N | propose <file>]", "list, decide or propose spec amendments"),
     ("agents", "", "agents running now"),
     ("logs", "<agent>", "one agent's transcript, e.g. /logs worker-3"),
     ("bulletin", "", "recent shared notices"),
@@ -231,6 +233,7 @@ pub fn parse(line: &str) -> Result<Input, String> {
         "amend" | "amendments" => match words.as_slice() {
             [] | ["list"] => Ok(Cmd::Amend(None)),
             ["propose", f] => Ok(Cmd::AmendPropose(f.to_string())),
+            ["approve", n, "--accept-weakening"] => n.parse::<u32>().map(Cmd::AmendAcceptWeakening).map_err(|_| usage("amend")),
             [verb @ ("approve" | "reject"), n] => n
                 .parse::<u32>()
                 .map(|n| Cmd::Amend(Some((*verb == "approve", n))))
@@ -330,6 +333,7 @@ mod tests {
         assert_eq!(parse("/prove single").unwrap(), Input::Cmd(Cmd::Prove { single: true }));
         assert_eq!(parse("/amend approve 3").unwrap(), Input::Cmd(Cmd::Amend(Some((true, 3)))));
         assert_eq!(parse("/amend reject 12").unwrap(), Input::Cmd(Cmd::Amend(Some((false, 12)))));
+        assert_eq!(parse("/amend approve 4 --accept-weakening").unwrap(), Input::Cmd(Cmd::AmendAcceptWeakening(4)));
         assert_eq!(parse("/logs worker-3").unwrap(), Input::Cmd(Cmd::Logs("worker-3".into())));
         for c in ["status", "review", "approve", "restart", "pause", "resume", "stop", "kill", "gate", "tcb", "agents", "bulletin", "cost", "doctor", "clear", "quit"] {
             assert!(matches!(parse(&format!("/{c}")), Ok(Input::Cmd(_))), "{c}");
@@ -343,7 +347,7 @@ mod tests {
         assert!(parse("/model worker gpt").unwrap_err().contains("unknown backend"));
         assert_eq!(parse("/btw").unwrap_err(), "usage: /btw <question>");
         assert_eq!(parse("/search").unwrap_err(), "usage: /search <query>");
-        assert_eq!(parse("/amend approve x").unwrap_err(), "usage: /amend [approve N | reject N | propose <file>]");
+        assert_eq!(parse("/amend approve x").unwrap_err(), "usage: /amend [approve N [--accept-weakening] | reject N | propose <file>]");
         assert_eq!(parse("/amend propose p.json").unwrap(), Input::Cmd(Cmd::AmendPropose("p.json".into())));
         assert_eq!(parse("/gaet").unwrap_err(), "unknown command /gaet. Did you mean /gate?");
         assert!(parse("/zzzzzz").unwrap_err().contains("/help"));

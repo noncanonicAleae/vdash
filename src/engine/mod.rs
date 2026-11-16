@@ -43,7 +43,7 @@ pub struct Engine<'p> {
     /// Snapshot taken before this round's agents ran (None after a resume).
     pub snap: Option<Snapshot>,
     /// Amendment decisions received from the user, for the amend stage.
-    pub decisions: Vec<(u32, bool)>,
+    pub decisions: Vec<(u32, crate::amend::Decision)>,
     /// Set once the engine has re-verified every "proved" goal in this run.
     pub rechecked: bool,
 }
@@ -118,9 +118,20 @@ impl<'p> Engine<'p> {
                         }
                         self.note(round, "guidance queued for the orchestrator's next call");
                     }
-                    Control::AmendDecision { n, approve } => {
-                        self.decisions.push((n, approve));
-                        self.note(round, format!("amendment {n}: {} by the user", if approve { "approved" } else { "rejected" }));
+                    Control::AmendDecision { n, approve, accept_weakening } => {
+                        use crate::amend::Decision;
+                        let d = match (approve, accept_weakening) {
+                            (false, _) => Decision::Reject,
+                            (true, false) => Decision::Approve,
+                            (true, true) => Decision::AcceptWeakening,
+                        };
+                        self.decisions.push((n, d));
+                        let what = match d {
+                            Decision::Reject => "rejected",
+                            Decision::Approve => "approved",
+                            Decision::AcceptWeakening => "approved, accepting the weaker guarantee,",
+                        };
+                        self.note(round, format!("amendment {n}: {what} by the user"));
                     }
                 }
             }

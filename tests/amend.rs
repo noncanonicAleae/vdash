@@ -137,6 +137,18 @@ fn m6_02_early_rejections_and_escalation_without_lean() {
         .iter()
         .any(|e| e.kind == "escalation" && e.u64("n") == Some(4)));
 
+    // An escalated proposal is not approved by a plain `approve`: it needs
+    // `--accept-weakening`. A human can dismiss it with `reject`.
+    let err = amend::approve_cmd(&ctx, 4, false).unwrap_err();
+    assert_eq!(err.code, 2);
+    assert!(err.message.contains("--accept-weakening"), "msg: {}", err.message);
+    assert!(err.message.contains(&r4.escalation_rel_path()), "msg: {}", err.message);
+    let err = amend::apply(&ctx, 4, "user", false).unwrap_err();
+    assert!(err.message.contains("--accept-weakening"), "msg: {}", err.message);
+    amend::reject_cmd(&ctx, 4).unwrap();
+    assert_eq!(amend::load_record(&ctx, 4).unwrap().status, "rejected");
+    assert!(ctx.campaign.root.join(r4.escalation_rel_path()).is_file());
+
     // Verify critic prompt contains NO content from Proof/ or Solution.lean
     let calls = fb.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
@@ -253,11 +265,11 @@ fn m6_02_and_m6_03_disproof_apply_gate_and_rollback_with_lean() {
     assert!(!v_before.ok, "solution for `≤` must be rejected while heldout still has `<`");
 
     // 4. Approve & apply amendment 002 via `approve_cmd`
-    let app_msg = amend::approve_cmd(&ctx, 2).unwrap();
+    let app_msg = amend::approve_cmd(&ctx, 2, false).unwrap();
     assert!(app_msg.contains("applied"));
 
     // Approving a non-pending amendment returns code 2
-    let err_twice = amend::approve_cmd(&ctx, 2).unwrap_err();
+    let err_twice = amend::approve_cmd(&ctx, 2, false).unwrap_err();
     assert_eq!(err_twice.code, 2);
 
     // Anchor verification is clean after `amend::apply`
@@ -302,7 +314,7 @@ fn m6_02_and_m6_03_disproof_apply_gate_and_rollback_with_lean() {
     assert_eq!(r_brk.n, 3);
     assert_eq!(r_brk.status, "pending");
 
-    let apply_err = amend::apply(&ctx, 3, "user").unwrap_err();
+    let apply_err = amend::apply(&ctx, 3, "user", false).unwrap_err();
     assert_eq!(apply_err.code, 1);
     assert!(apply_err.message.contains("rolled back"));
 
@@ -315,4 +327,40 @@ fn m6_02_and_m6_03_disproof_apply_gate_and_rollback_with_lean() {
     assert!(anchor::verify(&ctx).is_empty());
     let st = util::load_state(&ctx.campaign).unwrap();
     assert_eq!(st.phase, "approved");
+
+    // 6. An escalated weakening applies only with --accept-weakening, and is marked.
+    fb.reply(
+        Role::Critic,
+        json!({
+            "verdict": "escalate",
+            "touches_trusted_assumptions": true,
+            "closer_to_code": true,
+            "reason": "makes Sorted trivially true"
+        }),
+    );
+    let p_weaken = json!({
+        "file": "lean/Apc/Spec/Defs.lean",
+        "old_text": "  | x :: y :: r => x ≤ y ∧ Sorted (y :: r)",
+        "new_text": "  | _ :: _ :: _ => True",
+        "justification": "weakening test",
+        "evidence_kind": "argument",
+        "evidence_file": null,
+        "evidence_lean_name": null,
+        "alternatives_tried": "none"
+    });
+    let (r_wk, _) = amend::propose(&ctx, &pool, 3, &p_weaken).unwrap();
+    assert_eq!(r_wk.n, 4);
+    assert_eq!(r_wk.status, "escalated");
+    assert_eq!(amend::approve_cmd(&ctx, 4, false).unwrap_err().code, 2);
+    // The flag is refused on a record that is not escalated (003 is still pending).
+    let err = amend::approve_cmd(&ctx, 3, true).unwrap_err();
+    assert!(err.message.contains("not escalated"), "msg: {}", err.message);
+    let msg = amend::approve_cmd(&ctx, 4, true).unwrap();
+    assert!(msg.contains("weaker guarantee accepted"), "msg: {msg}");
+    let rec = amend::load_record(&ctx, 4).unwrap();
+    assert_eq!(rec.status, "applied");
+    assert!(rec.weakening_accepted);
+    assert!(fs::read_to_string(ctx.campaign.root.join(rec.rel_path())).unwrap().contains("Weakening accepted"));
+    assert!(amend::list_cmd(&ctx).unwrap().contains("[WEAKENING ACCEPTED]"));
+    assert!(anchor::verify(&ctx).is_empty());
 }

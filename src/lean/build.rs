@@ -503,6 +503,11 @@ pub fn format_capped_diagnostics(diags: &[Diagnostic]) -> Vec<String> {
 }
 
 pub fn check_file(ctx: &Ctx, file_arg: &Path, cwd: &Path) -> Result<(String, bool)> {
+    let (out, ok, _) = check_file_report(ctx, file_arg, cwd)?;
+    Ok((out, ok))
+}
+
+pub fn check_file_report(ctx: &Ctx, file_arg: &Path, cwd: &Path) -> Result<(String, bool, BuildReport)> {
     let resolved = if file_arg.is_absolute() {
         file_arg.to_path_buf()
     } else if ctx.campaign.root.join(file_arg).exists() {
@@ -565,7 +570,8 @@ pub fn check_file(ctx: &Ctx, file_arg: &Path, cwd: &Path) -> Result<(String, boo
 
     let mut out = lines.join("\n");
     out.push('\n');
-    Ok((out, rep.ok))
+    let ok = rep.ok;
+    Ok((out, ok, rep))
 }
 
 #[cfg(test)]

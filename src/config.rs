@@ -511,10 +511,18 @@ pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
             .unwrap_or(def_policy.comparator_cmd),
     };
 
+    let package = raw.package.unwrap_or_else(|| "Apc".to_string());
+    if package != "Apc" {
+        return Err(VdashError::new(
+            2,
+            format!("campaign.toml: unsupported package '{package}' (only \"Apc\" is supported)"),
+        ));
+    }
+
     Ok(Config {
         id: raw.id,
         host_project: raw.host_project,
-        package: raw.package.unwrap_or_else(|| "Apc".to_string()),
+        package,
         use_mathlib: raw.use_mathlib.unwrap_or(true),
         use_subscription: raw.use_subscription.unwrap_or(true),
         backends,
@@ -763,6 +771,13 @@ reviewer = ["claude:sonnet", "gemini"]
             "id = \"abc\"\nhost_project = \"{}\"\n[backends.claude]\nmax_concurrent = 0\n",
             host.display()
         ));
+
+        // 10. Unsupported package name
+        let err = write_and_err(&format!(
+            "id = \"abc\"\nhost_project = \"{}\"\npackage = \"CustomPkg\"\n",
+            host.display()
+        ));
+        assert!(err.message.contains("package"), "msg: {}", err.message);
     }
 
     #[test]

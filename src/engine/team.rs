@@ -287,6 +287,7 @@ fn adopt_orphans(eng: &Engine, round: u32, plan: Plan) -> Result<Plan> {
         let mut results: BTreeMap<String, lean::build::ModuleResult> = BTreeMap::new();
         for r in &roots {
             if let Ok(rep) = lean::build::build(&eng.ctx, &tree, &eng.ctx.campaign.build_work_dir(), Some(std::slice::from_ref(r))) {
+                record_module_times(&eng.ctx, &rep);
                 results.extend(rep.results);
             }
         }
@@ -343,12 +344,44 @@ fn read_file(ctx: &Ctx, rel: &str) -> String {
     fs::read_to_string(ctx.campaign.root.join(rel)).unwrap_or_default()
 }
 
+/// Persist fresh (non-cached) module elaboration times into `state.json` and prune
+/// entries whose `.lean` source file was removed (so `slow_modules` stays current).
+fn record_module_times(ctx: &Ctx, rep: &lean::build::BuildReport) {
+    if !ctx.campaign.state_file().is_file() {
+        return;
+    }
+    let updates: Vec<(String, f64)> = rep
+        .results
+        .iter()
+        .filter(|(_, mr)| mr.ok && !mr.cached && mr.seconds > 0.0)
+        .map(|(m, mr)| (m.clone(), mr.seconds))
+        .collect();
+    let has_stale = util::load_state(&ctx.campaign)
+        .map(|st| {
+            st.module_times
+                .keys()
+                .any(|m| !ctx.campaign.root.join(ctx.campaign.module_path(m)).is_file())
+        })
+        .unwrap_or(false);
+    if updates.is_empty() && !has_stale {
+        return;
+    }
+    let _ = util::update_state(&ctx.campaign, |st| {
+        st.module_times
+            .retain(|m, _| ctx.campaign.root.join(ctx.campaign.module_path(m)).is_file());
+        for (m, secs) in &updates {
+            st.module_times.insert(m.clone(), *secs);
+        }
+    });
+}
+
 /// Build one module of the work tree and check its declarations (M3-05).
 pub fn check_decls(ctx: &Ctx, file: &str, names: &[String]) -> std::result::Result<BTreeMap<String, fingerprint::DeclInfo>, String> {
     let module = ctx.campaign.module_name(file).map_err(|e| e.message)?;
     let tree = ctx.campaign.lean_dir();
     let build_dir = ctx.campaign.build_work_dir();
     let rep = lean::build::build(ctx, &tree, &build_dir, Some(std::slice::from_ref(&module))).map_err(|e| e.message)?;
+    record_module_times(ctx, &rep);
     if !rep.ok {
         return Err(format!("{file} does not build"));
     }
@@ -404,8 +437,9 @@ pub fn verify_claim(ctx: &Ctx, file: &str, names: &[String], defs: &[(String, St
 
 /// `Ok` when `file` builds with no sorry; otherwise the `vdash check` report.
 pub fn file_status(ctx: &Ctx, file: &str) -> std::result::Result<(), String> {
-    match lean::build::check_file(ctx, std::path::Path::new(file), &ctx.campaign.root) {
-        Ok((report, ok)) => {
+    match lean::build::check_file_report(ctx, std::path::Path::new(file), &ctx.campaign.root) {
+        Ok((report, ok, rep)) => {
+            record_module_times(ctx, &rep);
             let last = report.trim_end().lines().last().unwrap_or("");
             if ok && last == "OK" {
                 Ok(())
@@ -1107,8 +1141,12 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
         return Ok(());
     }
     let before_ok = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&["Apc.Solution".to_string()]))
-        .map(|r| r.ok)
+        .map(|r| {
+            record_module_times(&eng.ctx, &r);
+            r.ok
+        })
         .unwrap_or(false);
+    let st = eng.state()?;
     let snap = policy::snapshot(&eng.ctx);
     let mut slow: Vec<(&String, &f64)> = st.module_times.iter().filter(|(m, _)| m.starts_with("Apc.Proof")).collect();
     slow.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1122,7 +1160,10 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
     let vs = policy::enforce(&eng.ctx, &snap, Scope::Proof, &allowed)?;
     policy::report(&eng.ctx, round, &vs);
     let after_ok = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&["Apc.Solution".to_string()]))
-        .map(|r| r.ok)
+        .map(|r| {
+            record_module_times(&eng.ctx, &r);
+            r.ok
+        })
         .unwrap_or(false);
     // Every proved lemma must still exist somewhere it can be checked.
     let mut lost = Vec::new();
@@ -1228,4 +1269,60 @@ pub fn amend(eng: &mut Engine, round: u32) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendKind;
+    use crate::lean::build::{BuildReport, ModuleResult};
+    use crate::paths;
+    use tempfile::TempDir;
+
+    #[test]
+    fn record_module_times_updates_uncached_preserves_cached_and_prunes_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let host = tmp.path().join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("lean-toolchain"), "leanprover/lean4:v4.33.0\n").unwrap();
+
+        let camp = tmp.path().join("camp");
+        paths::init_campaign(&camp, &host, None, &[BackendKind::Claude]).unwrap();
+        let ctx = Ctx::for_test(&camp, tmp.path().join("state")).unwrap();
+
+        let slow_file = camp.join("lean/Apc/Proof/Lib/Slow.lean");
+        let work_file = camp.join("lean/Apc/Proof/Work/Temp.lean");
+        fs::create_dir_all(slow_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(work_file.parent().unwrap()).unwrap();
+        fs::write(&slow_file, "-- slow\n").unwrap();
+        fs::write(&work_file, "-- temp\n").unwrap();
+
+        let mut results = BTreeMap::new();
+        results.insert(
+            "Apc.Proof.Lib.Slow".to_string(),
+            ModuleResult { module: "Apc.Proof.Lib.Slow".into(), ok: true, cached: false, seconds: 12.5, diagnostics: vec![] },
+        );
+        results.insert(
+            "Apc.Proof.Work.Temp".to_string(),
+            ModuleResult { module: "Apc.Proof.Work.Temp".into(), ok: true, cached: false, seconds: 2.3, diagnostics: vec![] },
+        );
+        record_module_times(&ctx, &BuildReport { results, ok: true });
+
+        let st1 = util::load_state(&ctx.campaign).unwrap();
+        assert_eq!(st1.module_times.get("Apc.Proof.Lib.Slow"), Some(&12.5));
+        assert_eq!(st1.module_times.get("Apc.Proof.Work.Temp"), Some(&2.3));
+
+        // Cached rebuilds (seconds = 0.0) must not overwrite recorded times; deleted files are pruned.
+        fs::remove_file(&work_file).unwrap();
+        let mut cached_res = BTreeMap::new();
+        cached_res.insert(
+            "Apc.Proof.Lib.Slow".to_string(),
+            ModuleResult { module: "Apc.Proof.Lib.Slow".into(), ok: true, cached: true, seconds: 0.0, diagnostics: vec![] },
+        );
+        record_module_times(&ctx, &BuildReport { results: cached_res, ok: true });
+
+        let st2 = util::load_state(&ctx.campaign).unwrap();
+        assert_eq!(st2.module_times.get("Apc.Proof.Lib.Slow"), Some(&12.5));
+        assert!(!st2.module_times.contains_key("Apc.Proof.Work.Temp"));
+    }
 }

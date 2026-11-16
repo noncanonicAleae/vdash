@@ -767,6 +767,10 @@ impl Session {
                 self.busy("amend");
                 self.runner.vdash("amend", "amend", vec!["amend".into(), if approve { "approve" } else { "reject" }.into(), n.to_string()]);
             }
+            Cmd::AmendAcceptWeakening(n) => {
+                self.busy("amend");
+                self.runner.vdash("amend", "amend", vec!["amend".into(), "approve".into(), n.to_string(), "--accept-weakening".into()]);
+            }
             Cmd::AmendPropose(f) => {
                 self.busy("amend");
                 self.runner.vdash("amend", "amend", vec!["amend".into(), "propose".into(), f]);
