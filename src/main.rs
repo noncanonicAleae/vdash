@@ -347,9 +347,8 @@ fn run(cli: Cli) -> Result<()> {
             };
             match vdash::tui::commands::parse(&cmd_line) {
                 Ok(vdash::tui::commands::Input::Cmd(vdash::tui::commands::Cmd::Model(None))) => {
-                    for r in config::Role::ALL {
-                        let es: Vec<String> = ctx.cfg.entries_for(r).iter().map(|e| e.to_string()).collect();
-                        println!("{:<14} {}", r.to_string(), es.join(", "));
+                    for l in vdash::tui::role_lines(&ctx) {
+                        println!("{l}");
                     }
                     println!("\nAvailable models:");
                     println!("  claude   {}", vdash::tui::commands::CLAUDE_MODELS.join(", "));
@@ -357,30 +356,22 @@ fn run(cli: Cli) -> Result<()> {
                     Ok(())
                 }
                 Ok(vdash::tui::commands::Input::Cmd(vdash::tui::commands::Cmd::Model(Some((role, entry))))) => {
-                    let parsed: config::RoleEntry = entry.parse()?;
-                    if !ctx.cfg.backends.contains_key(&parsed.backend) {
-                        return Err(VdashError::new(2, format!("backend {} is not configured in campaign.toml", parsed.backend)));
-                    }
-                    let roles: Vec<config::Role> = if role == "all" {
-                        config::Role::ALL.to_vec()
-                    } else if role == "claude" || role == "gemini" {
-                        let m: Vec<config::Role> = config::Role::ALL
-                            .into_iter()
-                            .filter(|&r| ctx.cfg.entries_for(r).first().is_some_and(|e| e.backend == parsed.backend))
-                            .collect();
-                        if m.is_empty() { config::Role::ALL.to_vec() } else { m }
-                    } else {
-                        vec![role.parse()?]
-                    };
+                    let changes = config::model_change(&ctx.cfg, &role, &entry)?;
                     let running = vdash::events::engine_running(&ctx).is_some();
-                    for r in &roles {
+                    for (r, es) in &changes {
                         if running {
-                            vdash::events::send(&ctx, &vdash::events::Control::SetRole { role: r.to_string(), entries: vec![entry.clone()] })?;
+                            let entries = es.iter().map(|e| e.to_string()).collect();
+                            vdash::events::send(&ctx, &vdash::events::Control::SetRole { role: r.to_string(), entries })?;
                         } else {
-                            config::set_role(&ctx.campaign.root, *r, std::slice::from_ref(&parsed))?;
+                            config::set_role(&ctx.campaign.root, *r, es)?;
                         }
                     }
-                    println!("vdash: {role} → {entry}");
+                    if !running {
+                        vdash::engine::record_engine_file(&ctx, "campaign.toml");
+                    }
+                    for (r, es) in &changes {
+                        println!("vdash: {r} → {}", es.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", "));
+                    }
                     Ok(())
                 }
                 Ok(vdash::tui::commands::Input::Cmd(vdash::tui::commands::Cmd::ModelDefault)) => {
@@ -392,6 +383,7 @@ fn run(cli: Cli) -> Result<()> {
                         println!("vdash: default split sent to the running engine");
                     } else {
                         config::reset_roles(&ctx.campaign.root)?;
+                        vdash::engine::record_engine_file(&ctx, "campaign.toml");
                         println!("vdash: default split restored in campaign.toml");
                     }
                     println!("{}", config::default_split_summary());

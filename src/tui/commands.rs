@@ -46,7 +46,7 @@ pub enum Cmd {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("help", "", "list commands"),
     ("status", "", "campaign summary"),
-    ("model", "[default | <role|all> <backend>[:<model>]]", "show or change which backend and model serves each role"),
+    ("model", "[default | <role|all> <backend>[:<model>][,<backend>[:<model>]] | <backend> <model>]", "show or change which backend and model serves each role"),
     ("login", "[claude|gemini]", "sign in to your Claude or Gemini account"),
     ("search", "<query>", "search Mathlib, campaign Lean files, and online Loogle docs"),
     ("btw", "<question>", "ask the monitor a side question; work continues"),
@@ -146,6 +146,13 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// `/model` arguments, with a backend list such as `gemini, claude` joined into one
+/// word (`gemini,claude`).
+fn model_words(args: &str) -> Vec<String> {
+    let joined = args.split(',').map(str::trim).collect::<Vec<_>>().join(",");
+    joined.split_whitespace().map(String::from).collect()
+}
+
 pub fn parse(line: &str) -> Result<Input, String> {
     let line = line.trim();
     let Some(rest) = line.strip_prefix('/') else {
@@ -160,7 +167,7 @@ pub fn parse(line: &str) -> Result<Input, String> {
     let cmd = match name {
         "help" | "?" => none(Cmd::Help),
         "status" => none(Cmd::Status),
-        "model" | "models" => match words.as_slice() {
+        "model" | "models" => match model_words(args).iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             [] | ["list"] => Ok(Cmd::Model(None)),
             ["default"] => Ok(Cmd::ModelDefault),
             [backend @ ("claude" | "gemini"), model] => {
@@ -175,9 +182,11 @@ pub fn parse(line: &str) -> Result<Input, String> {
                 if !ROLES.contains(role) {
                     return Err(format!("unknown role '{role}'. Roles: {}", ROLES.join(", ")));
                 }
-                let backend = entry.split(':').next().unwrap_or("");
-                if !BACKENDS.contains(&backend) {
-                    return Err(format!("unknown backend '{backend}'. Backends: claude, gemini"));
+                for part in entry.split(',') {
+                    let backend = part.split(':').next().unwrap_or("");
+                    if !BACKENDS.contains(&backend) {
+                        return Err(format!("unknown backend '{backend}'. Backends: claude, gemini"));
+                    }
                 }
                 Ok(Cmd::Model(Some((role.to_string(), entry.to_string()))))
             }
@@ -278,14 +287,24 @@ pub fn complete(line: &str, agents: &[String]) -> Vec<String> {
             .map(|m| format!("/model {backend} {m}"))
             .collect(),
         ["model", role, be] => {
+            // Complete the last entry of a list such as `gemini,cl`.
+            let (head, be) = match be.rfind(',') {
+                Some(i) => (&be[..=i], &be[i + 1..]),
+                None => ("", *be),
+            };
             if let Some((b, m_prefix)) = be.split_once(':') {
                 models_for_backend(b)
                     .iter()
                     .filter(|m| m.starts_with(m_prefix))
-                    .map(|m| format!("/model {role} {b}:{m}"))
+                    .map(|m| format!("/model {role} {head}{b}:{m}"))
                     .collect()
             } else {
-                BACKENDS.iter().filter(|b| b.starts_with(be)).map(|b| format!("/model {role} {b}")).collect()
+                let mut out: Vec<String> = BACKENDS.iter().filter(|b| b.starts_with(be)).map(|b| format!("/model {role} {head}{b}")).collect();
+                // A role (not a backend name) can be shared by both backends.
+                if head.is_empty() && !BACKENDS.contains(role) {
+                    out.extend(["claude,gemini", "gemini,claude"].iter().filter(|l| l.starts_with(be)).map(|l| format!("/model {role} {l}")));
+                }
+                out
             }
         }
         ["model", role, be, model_prefix] => models_for_backend(be)
@@ -326,6 +345,9 @@ mod tests {
         assert_eq!(parse("/model default").unwrap(), Input::Cmd(Cmd::ModelDefault));
         assert_eq!(parse("/model worker gemini:gemini-4-argon-high").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini:gemini-4-argon-high".into())))));
         assert_eq!(parse("/model worker gemini gemini-4-argon-high").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini:gemini-4-argon-high".into())))));
+        assert_eq!(parse("/model worker gemini,claude:sonnet").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini,claude:sonnet".into())))));
+        assert_eq!(parse("/model worker gemini, claude").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini,claude".into())))));
+        assert!(parse("/model worker gemini,gpt").unwrap_err().contains("unknown backend"));
         assert_eq!(parse("/model claude opus").unwrap(), Input::Cmd(Cmd::Model(Some(("claude".into(), "claude:opus".into())))));
         assert_eq!(parse("/login").unwrap(), Input::Cmd(Cmd::Login(None)));
         assert_eq!(parse("/login claude").unwrap(), Input::Cmd(Cmd::Login(Some("claude".into()))));
@@ -346,7 +368,7 @@ mod tests {
 
     #[test]
     fn errors_name_the_usage_and_suggest() {
-        assert_eq!(parse("/model worker").unwrap_err(), "usage: /model [default | <role|all> <backend>[:<model>]]");
+        assert_eq!(parse("/model worker").unwrap_err(), "usage: /model [default | <role|all> <backend>[:<model>][,<backend>[:<model>]] | <backend> <model>]");
         assert!(parse("/model wrker claude").unwrap_err().contains("unknown role"));
         assert!(parse("/model worker gpt").unwrap_err().contains("unknown backend"));
         assert_eq!(parse("/btw").unwrap_err(), "usage: /btw <question>");
@@ -363,7 +385,9 @@ mod tests {
         assert_eq!(complete("/st", &[]), vec!["/status", "/stop"]);
         assert_eq!(complete("/model wo", &[]), vec!["/model worker"]);
         assert_eq!(complete("/model de", &[]), vec!["/model default"]);
-        assert_eq!(complete("/model worker g", &[]), vec!["/model worker gemini"]);
+        assert_eq!(complete("/model worker g", &[]), vec!["/model worker gemini", "/model worker gemini,claude"]);
+        assert_eq!(complete("/model worker gemini,c", &[]), vec!["/model worker gemini,claude"]);
+        assert_eq!(complete("/model claude g", &[]), Vec::<String>::new());
         assert_eq!(complete("/model worker claude:o", &[]), vec!["/model worker claude:opus"]);
         assert_eq!(complete("/model worker gemini gemini-3.8-flash-h", &[]), vec!["/model worker gemini gemini-3.8-flash-high"]);
         assert_eq!(complete("/login c", &[]), vec!["/login claude"]);

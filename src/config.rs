@@ -407,7 +407,7 @@ pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
         command: claude_raw
             .command
             .unwrap_or_else(|| vec!["claude".to_string()]),
-        max_concurrent: claude_raw.max_concurrent.unwrap_or(4),
+        max_concurrent: claude_raw.max_concurrent.unwrap_or(8),
     };
     if claude_cfg.command.is_empty() || claude_cfg.max_concurrent < 1 {
         return Err(VdashError::new(
@@ -421,7 +421,7 @@ pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
         command: gemini_raw
             .command
             .unwrap_or_else(|| vec!["agy".to_string()]),
-        max_concurrent: gemini_raw.max_concurrent.unwrap_or(4),
+        max_concurrent: gemini_raw.max_concurrent.unwrap_or(8),
     };
     if gemini_cfg.command.is_empty() || gemini_cfg.max_concurrent < 1 {
         return Err(VdashError::new(
@@ -550,6 +550,57 @@ pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
     })
 }
 
+/// Parse a comma-separated role spec, such as `gemini,claude:sonnet`.
+pub fn parse_entries(list: &str) -> Result<Vec<RoleEntry>> {
+    let es: Vec<RoleEntry> = list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::parse).collect::<Result<_>>()?;
+    if es.is_empty() {
+        return Err(VdashError::new(2, "a role needs at least one backend entry"));
+    }
+    Ok(es)
+}
+
+/// What `/model <target> <entries>` assigns, role by role. `target` is a role,
+/// `all`, or a backend name. A backend name changes only that backend's entries
+/// wherever they appear, so `/model claude opus` keeps the Gemini half of a
+/// shared role such as `worker = ["claude:sonnet", "gemini"]`.
+pub fn model_change(cfg: &Config, target: &str, list: &str) -> Result<Vec<(Role, Vec<RoleEntry>)>> {
+    let entries = parse_entries(list)?;
+    for e in &entries {
+        if !cfg.backends.contains_key(&e.backend) {
+            return Err(VdashError::new(2, format!("backend {} is not configured in campaign.toml", e.backend)));
+        }
+    }
+    if target == "all" {
+        return Ok(Role::ALL.into_iter().map(|r| (r, entries.clone())).collect());
+    }
+    if let Ok(b) = target.parse::<BackendKind>() {
+        if entries.len() != 1 || entries[0].backend != b {
+            return Err(VdashError::new(2, format!("/model {target} takes one {target} model")));
+        }
+        let new = &entries[0];
+        let mut out = Vec::new();
+        for r in Role::ALL {
+            let old = cfg.entries_for(r);
+            if !old.iter().any(|e| e.backend == b) {
+                continue;
+            }
+            let mut es: Vec<RoleEntry> = Vec::new();
+            for e in old {
+                let e = if e.backend == b { new } else { e };
+                if !es.contains(e) {
+                    es.push(e.clone());
+                }
+            }
+            out.push((r, es));
+        }
+        if out.is_empty() {
+            out = Role::ALL.into_iter().map(|r| (r, entries.clone())).collect();
+        }
+        return Ok(out);
+    }
+    Ok(vec![(target.parse()?, entries)])
+}
+
 /// Write the built-in split for every role into `campaign.toml` (`/model default`).
 pub fn reset_roles(campaign_dir: impl AsRef<Path>) -> Result<()> {
     for r in Role::ALL {
@@ -631,6 +682,42 @@ mod tests {
     }
 
     #[test]
+    fn model_change_targets() {
+        let tmp = TempDir::new().unwrap();
+        let host = make_host(&tmp);
+        let camp = tmp.path().join("camp");
+        fs::create_dir_all(&camp).unwrap();
+        fs::write(
+            camp.join("campaign.toml"),
+            format!(
+                "id = \"0123456789abcdef0123456789abcdef\"\nhost_project = \"{}\"\n[roles]\nworker = [\"claude:sonnet\", \"gemini\"]\n",
+                host.display()
+            ),
+        )
+        .unwrap();
+        let cfg = load(&camp).unwrap();
+        let show = |c: &[(Role, Vec<RoleEntry>)], r: Role| {
+            c.iter().find(|(x, _)| *x == r).map(|(_, es)| es.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","))
+        };
+        // A list for one role.
+        let c = model_change(&cfg, "worker", "gemini, claude:opus").unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(show(&c, Role::Worker).unwrap(), "gemini,claude:opus");
+        // A backend name swaps only that backend's entries and keeps the other half.
+        let c = model_change(&cfg, "claude", "claude:opus").unwrap();
+        assert_eq!(show(&c, Role::Worker).unwrap(), "claude:opus,gemini");
+        assert_eq!(show(&c, Role::Orchestrator).unwrap(), "claude:opus");
+        assert_eq!(show(&c, Role::Reviewer), None);
+        let c = model_change(&cfg, "gemini", "gemini:pro").unwrap();
+        assert_eq!(show(&c, Role::Worker).unwrap(), "claude:sonnet,gemini:pro");
+        assert_eq!(show(&c, Role::Orchestrator), None);
+        assert!(model_change(&cfg, "claude", "gemini").is_err());
+        // all
+        assert_eq!(model_change(&cfg, "all", "gemini,claude").unwrap().len(), Role::ALL.len());
+        assert!(model_change(&cfg, "worker", ",").is_err());
+    }
+
+    #[test]
     fn defaults_and_role_parsing() {
         let tmp = TempDir::new().unwrap();
         let host = make_host(&tmp);
@@ -650,9 +737,9 @@ mod tests {
         assert!(cfg.use_mathlib);
         assert!(cfg.use_subscription);
         assert_eq!(cfg.backend_cfg(BackendKind::Claude).command, vec!["claude"]);
-        assert_eq!(cfg.backend_cfg(BackendKind::Claude).max_concurrent, 4);
+        assert_eq!(cfg.backend_cfg(BackendKind::Claude).max_concurrent, 8);
         assert_eq!(cfg.backend_cfg(BackendKind::Gemini).command, vec!["agy"]);
-        assert_eq!(cfg.backend_cfg(BackendKind::Gemini).max_concurrent, 4);
+        assert_eq!(cfg.backend_cfg(BackendKind::Gemini).max_concurrent, 8);
         assert_eq!(
             cfg.entries_for(Role::SpecWriter),
             &[RoleEntry {

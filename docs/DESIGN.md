@@ -354,7 +354,7 @@ proof strategy") and is also appended to `STRATEGY.md`.
 |---|---|
 | `/help` | list commands |
 | `/status` | the plain summary |
-| `/model` | show the role → backend:model table; `/model <role\|all> <backend>[:<model>]` changes it, live; `/model default` restores the §3 split for every role |
+| `/model` | show the role → backend:model table; `/model <role\|all> <backend>[:<model>][,…]` changes it, live (a comma list shares the role); `/model <backend> <model>` swaps that backend's entries in every role; `/model default` restores the §3 split for every role |
 | `/btw <question>` | a side question answered by the read-only monitor agent from state, logs and bulletin, without disturbing the running work |
 | `/spec`, `/review`, `/approve` | draft or revise the spec, rerun reviewers, approve |
 | `/prove`, `/pause`, `/resume`, `/stop` | control the engine |
@@ -377,10 +377,10 @@ use_mathlib = true
 use_subscription = true
 [backends.claude]
 command = ["claude"]
-max_concurrent = 4
+max_concurrent = 8
 [backends.gemini]
 command = ["agy"]
-max_concurrent = 4
+max_concurrent = 8
 [roles]                       # backend[:model], or a list to share a role
 spec_writer = "claude"
 reviewer = "gemini"

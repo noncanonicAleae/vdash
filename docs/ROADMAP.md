@@ -371,10 +371,10 @@ use_subscription = true
 
 [backends.claude]
 command = ["claude"]
-max_concurrent = 4
+max_concurrent = 8
 [backends.gemini]
 command = ["agy"]                # Antigravity CLI (facts A1–A6)
-max_concurrent = 4
+max_concurrent = 8
 
 [roles]                          # "backend" or "backend:model", or a list of them
 spec_writer = "claude"
@@ -1215,7 +1215,7 @@ agent and between stages), acts, and moves each to `inbox/done/`.
     `pause`, `resume`, `stop`, `gate`, `tcb`, `amend [approve N | reject N]`,
     `agents`, `logs <agent>`, `bulletin`, `cost`, `doctor`, `quit`.
   - Errors are one-line messages naming the usage, e.g.
-    `usage: /model <role|all> <backend>[:<model>]`. An unknown command suggests the
+    `usage: /model [default | <role|all> <backend>[:<model>][,<backend>[:<model>]] | <backend> <model>]`. An unknown command suggests the
     closest known one (edit distance ≤ 2).
   - `complete(prefix) -> Vec<&str>` for command names; for `/model `, role names then
     backend names; for `/logs `, agent ids seen in events.
@@ -1647,3 +1647,21 @@ Gemini owns M8-03..M8-06.
   `engine::tests::git_enforce_keeps_engine_written_files_after_a_restart`. The
   campaign was repaired by hand: revision 6 restored from `logs/18/architect-512.json`
   and committed, round 19 reset to the plan stage.
+- 2026-11-16 (Claude): sequent-calculus again lost `worker = ["gemini", "claude"]`.
+  A `/model` change made while no engine ran was written to `campaign.toml` but not
+  recorded as engine-owned, so the round-19 resume (no snapshot, enforcing against
+  git) reverted it, and the next live `/model team_lead gemini` reloaded the
+  reverted all-Gemini file. Offline `/model` and `/model default` (TUI and
+  `vdash model`) now call `record_engine_file`. `/model <role> a,b` sets a list
+  (completion offers `claude,gemini` / `gemini,claude`); `/model <backend> <model>`
+  now swaps only that backend's entries, so a shared role keeps its other half
+  (`config::model_change`). Default `max_concurrent` raised from 4 to 8 per backend
+  at the user's request. Tests: `config::tests::model_change_targets`,
+  `tui::tests::offline_model_list_survives_a_mid_round_resume`, parser/completion
+  cases.
+- 2026-11-16 (Claude): `/model` and `vdash model` showed a stale table after a live
+  change: the engine saves a queued `SetRole` only between agents or stages, and the
+  app printed its cached config. `tui::role_lines` now reads `campaign.toml` from disk
+  and overlays `SetRole` messages still in the inbox, marked pending (the pool already
+  routes new calls by them). Test:
+  `tui::tests::model_table_shows_pending_then_saved_live_changes`.

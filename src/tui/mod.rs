@@ -19,7 +19,7 @@ use crossterm::{event::DisableBracketedPaste, event::EnableBracketedPaste, execu
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::config::{self, Role, RoleEntry};
+use crate::config::{self, Role};
 use crate::error::{VdashError, Result};
 use crate::events::{self, Control};
 use crate::paths::Ctx;
@@ -292,11 +292,35 @@ impl Runner {
     }
 }
 
+/// One line per role: what `campaign.toml` says now (read from disk, since a
+/// running engine writes it), plus any `/model` change still in the engine's inbox.
+/// The pool already routes new calls by a pending change; the engine saves it to
+/// the file between agents or stages.
+pub fn role_lines(ctx: &Ctx) -> Vec<String> {
+    let cfg = config::load(&ctx.campaign.root).unwrap_or_else(|_| ctx.cfg.clone());
+    let mut pending: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for c in events::peek(ctx) {
+        if let Control::SetRole { role, entries } = c {
+            pending.insert(role, entries);
+        }
+    }
+    Role::ALL
+        .into_iter()
+        .map(|r| {
+            let es = cfg.entries_for(r).iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
+            match pending.get(&r.to_string()).map(|p| p.join(", ")) {
+                Some(p) if p != es => format!("{:<14} {p}   (was {es}; new calls use it, saved to campaign.toml after the current stage)", r.to_string()),
+                _ => format!("{:<14} {es}", r.to_string()),
+            }
+        })
+        .collect()
+}
+
 fn role_table(ctx: &Ctx, app: &App) -> String {
     let mut s = String::from("role           backend[:model]\n");
-    for r in Role::ALL {
-        let es: Vec<String> = ctx.cfg.entries_for(r).iter().map(|e| e.to_string()).collect();
-        s.push_str(&format!("{:<14} {}\n", r.to_string(), es.join(", ")));
+    for l in role_lines(ctx) {
+        s.push_str(&l);
+        s.push('\n');
     }
     s.push('\n');
     for (k, b) in &ctx.cfg.backends {
@@ -312,7 +336,7 @@ fn role_table(ctx: &Ctx, app: &App) -> String {
     s.push_str("\nAvailable models:\n");
     s.push_str(&format!("  claude   {}\n", commands::CLAUDE_MODELS.join(", ")));
     s.push_str(&format!("  gemini   {}\n", commands::GEMINI_MODELS.join(", ")));
-    s.push_str("\nChange with:\n  /model <role|all> <backend>[:<model>]   (e.g. /model worker gemini:gemini-4-argon-high)\n  /model <claude|gemini> <model>          (sets the model for all roles on that backend)");
+    s.push_str("\nChange with:\n  /model <role|all> <backend>[:<model>]   (e.g. /model worker gemini:gemini-4-argon-high)\n  /model <role> gemini,claude             (share a role between both backends)\n  /model <claude|gemini> <model>          (sets the model for all roles on that backend)");
     s
 }
 
@@ -625,58 +649,43 @@ impl Session {
                 Err(e) => self.app.say(Kind::Bad, "status", e.message),
             },
             Cmd::Model(None) => {
+                if let Ok(cfg) = config::load(&self.ctx.campaign.root) {
+                    self.ctx.cfg = cfg;
+                }
                 let t = role_table(&self.ctx, &self.app);
                 out(self, "model", t)
             }
             Cmd::Model(Some((role, entry))) => {
-                let parsed: Result<RoleEntry> = entry.parse();
-                let Ok(parsed) = parsed else {
-                    self.app.say(Kind::Warn, "model", format!("cannot parse '{entry}'"));
-                    return false;
-                };
-                if !self.ctx.cfg.backends.contains_key(&parsed.backend) {
-                    self.app.say(Kind::Warn, "model", format!("backend {} is not configured in campaign.toml", parsed.backend));
-                    return false;
-                }
-                let roles: Vec<Role> = if role == "all" {
-                    Role::ALL.to_vec()
-                } else if role == "claude" || role == "gemini" {
-                    let matching: Vec<Role> = Role::ALL
-                        .into_iter()
-                        .filter(|&r| {
-                            self.ctx
-                                .cfg
-                                .entries_for(r)
-                                .first()
-                                .is_some_and(|e| e.backend == parsed.backend)
-                        })
-                        .collect();
-                    if matching.is_empty() {
-                        Role::ALL.to_vec()
-                    } else {
-                        matching
+                let changes = match config::model_change(&self.ctx.cfg, &role, &entry) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.app.say(Kind::Warn, "model", e.message);
+                        return false;
                     }
-                } else {
-                    role.parse().map(|r| vec![r]).unwrap_or_default()
                 };
-                for r in &roles {
-                    if self.app.engine.is_some() {
-                        let _ = events::send(&self.ctx, &Control::SetRole { role: r.to_string(), entries: vec![entry.clone()] });
-                    } else if let Err(e) = config::set_role(&self.ctx.campaign.root, *r, std::slice::from_ref(&parsed)) {
+                let live = self.app.engine.is_some();
+                for (r, es) in &changes {
+                    if live {
+                        let entries = es.iter().map(|e| e.to_string()).collect();
+                        let _ = events::send(&self.ctx, &Control::SetRole { role: r.to_string(), entries });
+                    } else if let Err(e) = config::set_role(&self.ctx.campaign.root, *r, es) {
                         self.app.say(Kind::Bad, "model", e.message);
                         return false;
                     }
                 }
+                if !live {
+                    crate::engine::record_engine_file(&self.ctx, "campaign.toml");
+                }
                 if let Ok(cfg) = config::load(&self.ctx.campaign.root) {
                     self.ctx.cfg = cfg;
                 }
-                let how = if self.app.engine.is_some() { "sent to the engine; it applies to the next attempt of every agent, including one waiting on a usage limit" } else { "saved to campaign.toml" };
-                let target_desc = if role == "claude" || role == "gemini" {
-                    format!("all {role} roles ({})", roles.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", "))
-                } else {
-                    role
-                };
-                self.app.say(Kind::Good, "model", format!("{target_desc} → {entry} ({how})"));
+                let how = if live { "sent to the engine; it applies to the next attempt of every agent, including one waiting on a usage limit" } else { "saved to campaign.toml" };
+                let desc = changes
+                    .iter()
+                    .map(|(r, es)| format!("{r} → {}", es.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                self.app.say(Kind::Good, "model", format!("{desc} ({how})"));
             }
             Cmd::ModelDefault => {
                 let live = self.app.engine.is_some();
@@ -692,6 +701,9 @@ impl Session {
                 }
                 if let Ok(cfg) = config::load(&self.ctx.campaign.root) {
                     self.ctx.cfg = cfg;
+                }
+                if !live {
+                    crate::engine::record_engine_file(&self.ctx, "campaign.toml");
                 }
                 let how = if live { "sent to the engine; it applies to the next attempt of every agent" } else { "saved to campaign.toml" };
                 self.app.say(Kind::Good, "model", format!("default split restored ({how}). {}", config::default_split_summary()));
@@ -1143,6 +1155,40 @@ mod tests {
         s.exec("/frobnicate".into());
         assert_eq!(s.app.transcript.last().unwrap().kind, Kind::Warn);
         assert!(s.exec("/quit".into()));
+    }
+
+    /// The sequent-calculus bug: a `/model` change saved while no engine ran was
+    /// reverted to the last commit by the next mid-round resume, and a later live
+    /// `/model` then reloaded the reverted file.
+    #[test]
+    fn offline_model_list_survives_a_mid_round_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = session(&tmp);
+        let _ = crate::util::commit_all(&s.ctx.campaign, "baseline");
+        s.exec("/model worker gemini, claude".into());
+        let cfg = config::load(&s.ctx.campaign.root).unwrap();
+        let es: Vec<String> = cfg.entries_for(Role::Worker).iter().map(|e| e.to_string()).collect();
+        assert_eq!(es, vec!["gemini", "claude"]);
+        let vs = crate::engine::enforce_against_git(&s.ctx, &std::collections::BTreeSet::new()).unwrap();
+        assert!(vs.iter().all(|v| v.path != "campaign.toml"), "{vs:?}");
+        let cfg = config::load(&s.ctx.campaign.root).unwrap();
+        assert_eq!(cfg.entries_for(Role::Worker).len(), 2);
+    }
+
+    /// With an engine running, `/model` only queues the change; the table must show
+    /// it (pending) and, once the engine has saved it, read it back from disk.
+    #[test]
+    fn model_table_shows_pending_then_saved_live_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = session(&tmp);
+        events::send(&s.ctx, &Control::SetRole { role: "team_lead".into(), entries: vec!["gemini".into(), "claude".into()] }).unwrap();
+        let line = role_lines(&s.ctx).into_iter().find(|l| l.starts_with("team_lead")).unwrap();
+        assert!(line.contains("gemini, claude") && line.contains("new calls use it"), "{line}");
+        // The engine drains the inbox and writes the file; the app's cached cfg is stale.
+        let _ = events::drain(&s.ctx);
+        config::set_role(&s.ctx.campaign.root, Role::TeamLead, &config::parse_entries("gemini,claude").unwrap()).unwrap();
+        let line = role_lines(&s.ctx).into_iter().find(|l| l.starts_with("team_lead")).unwrap();
+        assert_eq!(line, format!("{:<14} gemini, claude", "team_lead"));
     }
 
     #[test]

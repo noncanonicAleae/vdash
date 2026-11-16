@@ -156,8 +156,9 @@ Run `vdash` with no subcommand inside a campaign to open the terminal UI.
 | `/login [claude\|gemini]` | Check account status or sign in interactively to Claude or Gemini |
 | `/model` (or `/model list`) | Show the role → `backend[:model]` table, backend health, and available models |
 | `/model <role\|all> <backend>[:<model>]` | Assign a role (or `all` roles) to a backend and optional model |
+| `/model <role\|all> <backend>,<backend>` | Share a role between backends, e.g. `/model worker gemini,claude`: each call goes to whichever has a free slot |
 | `/model <role\|all> <backend> <model>` | Three-argument shorthand, e.g. `/model worker claude opus` |
-| `/model <claude\|gemini> <model>` | Set the model for every role currently assigned to that backend |
+| `/model <claude\|gemini> <model>` | Set the model for every role that uses that backend; a shared role keeps its other backend |
 | `/model default` | Restore the default split (Claude: planning, leads, integrator, critic, monitor; Gemini: reviewer, falsifier; workers on both). Also `vdash model default` |
 | `/search <query>` | Search local Mathlib/campaign `.lean` files and online Loogle documentation |
 | `/btw <question>` | Ask the read-only Monitor agent a side question while work continues |
@@ -224,6 +225,7 @@ Inside the interactive TUI:
 /model gemini gemini-4-hydrogen-high             # Switch all Gemini roles to gemini-4-hydrogen-high
 /model all claude:sonnet                         # Put every role on Claude Sonnet
 /model all gemini:gemini-4-argon-high            # Put every role on Gemini 4 Argon High
+/model worker gemini,claude:sonnet               # Workers on both subscriptions
 ```
 
 From the command line (using `-C <DIR>` or from inside the campaign directory):
