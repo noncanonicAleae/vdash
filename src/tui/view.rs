@@ -364,6 +364,18 @@ fn header(f: &mut Frame, area: Rect, app: &App, ui: &Ui, p: &Palette) {
     f.render_widget(Paragraph::new(vec![TLine::from(l1), TLine::from(l2)]).block(block), area);
 }
 
+/// First row of the targets panel. The list stays in name order; when it does
+/// not fit in `rows`, the window starts at the first unaccepted target (so the
+/// view moves on to the remaining work each time a gate result arrives at the
+/// end of a round), clamped so the window stays full.
+fn targets_window(accepted: &[bool], rows: usize) -> usize {
+    if accepted.len() <= rows {
+        return 0;
+    }
+    let first_open = accepted.iter().position(|ok| !ok).unwrap_or(0);
+    first_open.min(accepted.len() - rows.max(1))
+}
+
 fn side(f: &mut Frame, area: Rect, app: &App, ui: &Ui, p: &Palette) {
     let n_agents = app.agents.len().max(1) as u16;
     let n_targets = app.targets.len().max(1) as u16;
@@ -403,7 +415,11 @@ fn side(f: &mut Frame, area: Rect, app: &App, ui: &Ui, p: &Palette) {
     if app.targets.is_empty() {
         targets.push(TLine::from(Span::styled("none until the spec is approved", Style::default().fg(p.faint))));
     }
-    for (name, (ok, reasons)) in &app.targets {
+    let rows = t_area.height.saturating_sub(2) as usize;
+    let oks: Vec<bool> = app.targets.values().map(|(ok, _)| *ok).collect();
+    let start = targets_window(&oks, rows);
+    let below = oks.len().saturating_sub(start + rows);
+    for (name, (ok, reasons)) in app.targets.iter().skip(start).take(rows.max(1)) {
         let short = name.strip_prefix("Apc.").unwrap_or(name);
         let mut spans = vec![if *ok {
             Span::styled("✓ ", Style::default().fg(p.good).add_modifier(Modifier::BOLD))
@@ -420,7 +436,15 @@ fn side(f: &mut Frame, area: Rect, app: &App, ui: &Ui, p: &Palette) {
         }
         targets.push(TLine::from(spans));
     }
-    f.render_widget(Paragraph::new(targets).block(titled("targets")), t_area);
+    let acc = oks.iter().filter(|o| **o).count();
+    let mut t_title = if oks.is_empty() { "targets".to_string() } else { format!("targets {acc}/{}", oks.len()) };
+    if start > 0 {
+        t_title.push_str(&format!(" ↑{start}"));
+    }
+    if below > 0 {
+        t_title.push_str(&format!(" ↓{below}"));
+    }
+    f.render_widget(Paragraph::new(targets).block(titled(&t_title)), t_area);
 
     let mut goals: Vec<TLine> = Vec::new();
     let total: usize = app.goals.values().sum();
@@ -657,6 +681,34 @@ mod tests {
         println!("{}", render(120, 30, &app, &Ui::default()));
         println!("{}", render(80, 24, &app, &Ui { input: "/model wo".into(), cursor: 9, completions: vec!["/model worker".into()], ..Default::default() }));
         println!("{}", render(100, 20, &App::new("fresh"), &Ui::default()));
+    }
+
+    #[test]
+    fn targets_window_follows_the_first_open_target() {
+        assert_eq!(targets_window(&[true, false, true], 5), 0, "fits: no scroll");
+        let mut v = vec![true; 30];
+        v[20] = false;
+        v[25] = false;
+        assert_eq!(targets_window(&v, 8), 20);
+        v[20] = true;
+        v[25] = true;
+        v[28] = false;
+        assert_eq!(targets_window(&v, 8), 22, "clamped so the window stays full");
+        assert_eq!(targets_window(&[true; 30], 8), 0, "all accepted: back to the top");
+        assert_eq!(targets_window(&v, 0), 28, "zero rows: no panic");
+    }
+
+    #[test]
+    fn targets_panel_scrolls_to_remaining_targets() {
+        let mut app = fixture();
+        app.targets.clear();
+        for i in 0..40 {
+            app.targets.insert(format!("Apc.t{i:02}"), (i < 30, if i < 30 { vec![] } else { vec!["sorry".into()] }));
+        }
+        let s = render(120, 40, &app, &Ui::default());
+        assert!(s.contains("✗ t30"), "{s}");
+        assert!(!s.contains("✓ t00"), "{s}");
+        assert!(s.contains("targets 30/40 ↑"), "{s}");
     }
 
     #[test]
