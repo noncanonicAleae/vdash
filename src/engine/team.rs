@@ -305,6 +305,7 @@ fn adopt_orphans(eng: &Engine, round: u32, plan: Plan) -> Result<Plan> {
     let new_plan = plan::with_repairs(&plan, repairs);
     if new_plan != plan {
         jsonio::write_atomic(eng.ctx.campaign.plan_file(), &new_plan)?;
+        super::record_engine_file(&eng.ctx, "plan.json");
         let adopted: Vec<String> = new_plan.goals.iter().filter(|g| g.kind == "repair").map(|g| g.file.clone()).collect();
         if !adopted.is_empty() {
             eng.bulletin(round, "engine", &format!("orphaned files adopted as repair goals: {}", adopted.join(", ")));
@@ -633,6 +634,7 @@ pub fn plan(eng: &mut Engine, round: u32) -> Result<()> {
         }
     };
     jsonio::write_atomic(eng.ctx.campaign.plan_file(), &new_plan)?;
+    eng.own("plan.json");
     eng.update(|s| plan::merge_into_state(old.as_ref(), &new_plan, s))?;
     events::emit(&eng.ctx, round, "plan", json!({"revision": new_plan.revision, "goals": new_plan.goals.len()}));
     Ok(())
@@ -732,16 +734,34 @@ pub fn orchestrate(eng: &mut Engine, round: u32) -> Result<()> {
 // ------------------------------------------------------------------ leads
 
 struct Shared {
-    claimed: Mutex<BTreeSet<String>>,
+    /// File -> the lead that claimed it this round.
+    claimed: Mutex<BTreeMap<String, String>>,
     allowed: Mutex<BTreeSet<String>>,
 }
 
-fn claim(sh: &Shared, file: &str) -> bool {
-    let ok = sh.claimed.lock().unwrap().insert(file.to_string());
-    if ok {
-        sh.allowed.lock().unwrap().insert(file.to_string());
+/// Claim `file` for `lead` this round: one assignment per file, first come first
+/// served (also within one lead, so two workers never share a file).
+fn claim(sh: &Shared, lead: &str, file: &str) -> bool {
+    let mut c = sh.claimed.lock().unwrap();
+    if c.contains_key(file) {
+        return false;
     }
-    ok
+    c.insert(file.to_string(), lead.to_string());
+    sh.allowed.lock().unwrap().insert(file.to_string());
+    true
+}
+
+/// Claims carried into a resumed leads stage: only those of leads that already
+/// finished this round (have a summary). Leads that are re-run start over, so the
+/// files they held before the restart are free again. Older state has no `claims`
+/// map; then nothing is carried (the `allowed` set is kept either way).
+fn resumed_claims(prev: &Value, done: &Value) -> BTreeMap<String, String> {
+    prev.as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(f, l)| l.as_str().map(|l| (f.clone(), l.to_string())))
+        .filter(|(_, l)| done.get(l).and_then(|d| d.get("summary")).is_some())
+        .collect()
 }
 
 pub fn leads(eng: &mut Engine, round: u32) -> Result<()> {
@@ -757,7 +777,7 @@ pub fn leads(eng: &mut Engine, round: u32) -> Result<()> {
     // Warm the build cache for the spec so workers' checks start fast.
     let _ = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&["Apc.Challenge".to_string()]));
     let prev_allowed: BTreeSet<String> = serde_json::from_value(rd(eng, &["allowed"])).unwrap_or_default();
-    let sh = Shared { claimed: Mutex::new(prev_allowed.clone()), allowed: Mutex::new(prev_allowed) };
+    let sh = Shared { claimed: Mutex::new(resumed_claims(&rd(eng, &["claims"]), &done)), allowed: Mutex::new(prev_allowed) };
     let plan = load_plan(&eng.ctx).unwrap_or_else(|| fallback_plan(eng, 1));
     let eng_ref: &Engine = eng;
     let results: Vec<Result<()>> = std::thread::scope(|s| {
@@ -774,6 +794,7 @@ pub fn leads(eng: &mut Engine, round: u32) -> Result<()> {
     });
     let allowed: Vec<String> = sh.allowed.lock().unwrap().iter().cloned().collect();
     set_rd(eng, &["allowed"], json!(allowed))?;
+    set_rd(eng, &["claims"], json!(*sh.claimed.lock().unwrap()))?;
     for r in results {
         r?;
     }
@@ -819,7 +840,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
             .filter_map(|gid| plan.goal(gid).map(|g| (gid, g)))
             .filter_map(|(gid, g)| {
                 let file = format!("lean/Apc/Proof/Work/Refute_{}.lean", slug(gid));
-                if !claim(sh, &file) {
+                if !claim(sh, id, &file) {
                     return None;
                 }
                 Some(s.spawn(move || -> Value {
@@ -885,7 +906,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
     let mut kept = Vec::new();
     let mut deferred = Vec::new();
     for a in asgs {
-        if claim(sh, &a.file) {
+        if claim(sh, id, &a.file) {
             kept.push(a);
         } else {
             eng.bulletin(round, id, &format!("assignment of {} deferred: {} is already taken this round", a.goal, a.file));
@@ -1278,6 +1299,22 @@ mod tests {
     use crate::lean::build::{BuildReport, ModuleResult};
     use crate::paths;
     use tempfile::TempDir;
+
+    #[test]
+    fn resumed_leads_reclaim_their_own_files_but_not_finished_leads_files() {
+        let prev = json!({"a.lean": "L1", "b.lean": "L2", "c.lean": "L3"});
+        let done = json!({"L2": {"summary": "done"}, "L3": {"plan": {}}});
+        let carried = resumed_claims(&prev, &done);
+        assert_eq!(carried.into_iter().collect::<Vec<_>>(), vec![("b.lean".to_string(), "L2".to_string())]);
+        assert!(resumed_claims(&Value::Null, &done).is_empty());
+
+        let sh = Shared { claimed: Mutex::new(resumed_claims(&prev, &done)), allowed: Mutex::new(BTreeSet::new()) };
+        assert!(claim(&sh, "L1", "a.lean"), "a re-run lead's old file is free again");
+        assert!(!claim(&sh, "L1", "a.lean"), "one assignment per file, even within a lead");
+        assert!(!claim(&sh, "L3", "a.lean"), "and not for another lead");
+        assert!(!claim(&sh, "L1", "b.lean"), "a finished lead's file stays taken");
+        assert_eq!(sh.allowed.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn record_module_times_updates_uncached_preserves_cached_and_prunes_deleted() {

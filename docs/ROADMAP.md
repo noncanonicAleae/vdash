@@ -1632,3 +1632,18 @@ Gemini owns M8-03..M8-06.
   The split now lives in one place, `config::default_role_spec`, used by `load` too.
   Tests: `config::tests::reset_roles_restores_the_builtin_split`, `tui::commands` parse
   and completion.
+- 2026-11-16 (Claude): Two mid-round restart bugs, found from sequent-calculus
+  escalations 7/8 (round 18, killed in the leads stage and resumed). (1) The resumed
+  leads stage seeded its "taken this round" set with every file claimed before the
+  kill, so re-run leads collided with their own claims and every assignment was
+  deferred. Claims are now stored per lead (`round_data.claims`); only claims of
+  leads that already finished carry over. (2) With no in-memory snapshot after a
+  restart, enforcing against git reverted files the engine itself wrote earlier in
+  the round: the round-18 plan (revision 6, 146 goals) fell back to revision 5 and a
+  live `/model` change in `campaign.toml` was undone. `Engine::own` now records the
+  hash of every engine-written file (plan, config, guidance) in
+  `round_data.engine_files`, and `enforce_against_git` keeps a file that still
+  matches. Tests: `engine::team::tests::resumed_leads_reclaim_*`,
+  `engine::tests::git_enforce_keeps_engine_written_files_after_a_restart`. The
+  campaign was repaired by hand: revision 6 restored from `logs/18/architect-512.json`
+  and committed, round 19 reset to the plan stage.

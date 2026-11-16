@@ -113,9 +113,7 @@ impl<'p> Engine<'p> {
                         }
                         cur.push_str(&format!("\n## Guidance ({})\n\n{}\n", util::now_iso(), text.trim()));
                         std::fs::write(&p, cur).map_err(|e| VdashError::io_path(&p, e))?;
-                        if let Some(s) = self.snap.as_mut() {
-                            s.accept(&self.ctx, "STRATEGY.md");
-                        }
+                        self.own("STRATEGY.md");
                         self.note(round, "guidance queued for the orchestrator's next call");
                     }
                     Control::AmendDecision { n, approve, accept_weakening } => {
@@ -151,10 +149,18 @@ impl<'p> Engine<'p> {
         config::set_role(&self.ctx.campaign.root, r, &es)?;
         self.pool.set_role(r, es);
         self.ctx.cfg = config::load(&self.ctx.campaign.root)?;
-        if let Some(s) = self.snap.as_mut() {
-            s.accept(&self.ctx, "campaign.toml");
-        }
+        self.own("campaign.toml");
         Ok(())
+    }
+
+    /// Mark a file the engine itself just wrote (plan, config, guidance) as accepted:
+    /// in the in-memory snapshot, and by hash in `state.json`, so that enforcing
+    /// against git after a restart in mid-round does not revert it.
+    pub fn own(&mut self, rel: &str) {
+        if let Some(s) = self.snap.as_mut() {
+            s.accept(&self.ctx, rel);
+        }
+        record_engine_file(&self.ctx, rel);
     }
 
     /// Run the gatekeeper and record per-target verdicts.
@@ -220,7 +226,30 @@ pub fn record_verdict(ctx: &Ctx, round: u32, v: &gate::Verdict) -> Result<()> {
 
 /// After a resume there is no in-memory snapshot: restore disallowed changes from
 /// the last commit instead (the engine commits at the end of every round).
+/// Record the hash of an engine-written campaign file for this round (see `Engine::own`).
+pub fn record_engine_file(ctx: &Ctx, rel: &str) {
+    let Ok(bytes) = std::fs::read(ctx.campaign.root.join(rel)) else {
+        return;
+    };
+    let h = util::sha256_hex(&bytes);
+    let _ = util::update_state(&ctx.campaign, |s| {
+        if !s.round_data.is_object() {
+            s.round_data = json!({});
+        }
+        if !s.round_data["engine_files"].is_object() {
+            s.round_data["engine_files"] = json!({});
+        }
+        s.round_data["engine_files"][rel] = json!(h);
+    });
+}
+
 pub fn enforce_against_git(ctx: &Ctx, allowed: &BTreeSet<String>) -> Result<Vec<policy::Violation>> {
+    let engine_files = util::load_state(&ctx.campaign).map(|s| s.round_data["engine_files"].clone()).unwrap_or_default();
+    let written_by_engine = |path: &str| {
+        engine_files[path].as_str().is_some_and(|h| {
+            std::fs::read(ctx.campaign.root.join(path)).is_ok_and(|b| util::sha256_hex(&b) == h)
+        })
+    };
     let out = util::git(&ctx.campaign, &["status", "--porcelain", "-uall", "--no-renames"])?;
     let mut vs = Vec::new();
     for line in out.lines() {
@@ -232,6 +261,10 @@ pub fn enforce_against_git(ctx: &Ctx, allowed: &BTreeSet<String>) -> Result<Vec<
         // Engine-protected live files, and the held-out copy (the gate checks it
         // against the anchor, and it may not be committed yet).
         if path == "state.json" || path == "bulletin.md" || path.starts_with(".heldout/") {
+            continue;
+        }
+        // Written by the engine earlier this round (before a restart), unchanged since.
+        if written_by_engine(&path) {
             continue;
         }
         let ok = allowed.iter().any(|a| if a.ends_with('/') { path.starts_with(a.as_str()) } else { a == &path })
@@ -448,5 +481,47 @@ pub fn install_signal_handlers(stop: Arc<AtomicBool>) {
         // Order matters: the conditional shutdown sees the flag before it is set.
         let _ = signal_hook::flag::register_conditional_shutdown(sig, 130, Arc::clone(&stop));
         let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendKind;
+    use crate::paths;
+    use tempfile::TempDir;
+
+    #[test]
+    fn git_enforce_keeps_engine_written_files_after_a_restart() {
+        let tmp = TempDir::new().unwrap();
+        let host = tmp.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("lean-toolchain"), "leanprover/lean4:v4.33.0\n").unwrap();
+        let camp = tmp.path().join("camp");
+        paths::init_campaign(&camp, &host, None, &[BackendKind::Claude]).unwrap();
+        let ctx = Ctx::for_test(&camp, tmp.path().join("state")).unwrap();
+        std::fs::write(camp.join("plan.json"), "{\"revision\": 5}\n").unwrap();
+        util::commit_all(&ctx.campaign, "baseline").unwrap();
+        let toml = std::fs::read_to_string(camp.join("campaign.toml")).unwrap();
+
+        // The engine writes a new plan and config mid-round, then is killed.
+        std::fs::write(camp.join("plan.json"), "{\"revision\": 6}\n").unwrap();
+        record_engine_file(&ctx, "plan.json");
+        std::fs::write(camp.join("campaign.toml"), format!("{toml}\n# by the engine\n")).unwrap();
+        record_engine_file(&ctx, "campaign.toml");
+        // An agent edits a trusted file the engine never wrote.
+        std::fs::write(camp.join("STRATEGY.md"), "agent edit\n").unwrap();
+
+        let vs = enforce_against_git(&ctx, &BTreeSet::new()).unwrap();
+        let paths: Vec<&str> = vs.iter().map(|v| v.path.as_str()).collect();
+        assert_eq!(paths, vec!["STRATEGY.md"]);
+        assert_eq!(std::fs::read_to_string(camp.join("plan.json")).unwrap(), "{\"revision\": 6}\n");
+        assert!(std::fs::read_to_string(camp.join("campaign.toml")).unwrap().contains("# by the engine"));
+
+        // An edit after the engine's write no longer matches the recorded hash.
+        std::fs::write(camp.join("plan.json"), "{\"revision\": 99}\n").unwrap();
+        let vs = enforce_against_git(&ctx, &BTreeSet::new()).unwrap();
+        assert_eq!(vs.iter().map(|v| v.path.as_str()).collect::<Vec<_>>(), vec!["plan.json"]);
+        assert_eq!(std::fs::read_to_string(camp.join("plan.json")).unwrap(), "{\"revision\": 5}\n");
     }
 }
