@@ -317,6 +317,24 @@ struct RawConfig {
     policy: RawPolicy,
 }
 
+/// The built-in role split (DESIGN §3 table): Claude plans, leads, integrates and reviews
+/// amendments; Gemini reviews the spec and falsifies; workers use both.
+fn default_role_spec(role: Role) -> &'static [&'static str] {
+    match role {
+        Role::Reviewer | Role::Falsifier => &["gemini"],
+        Role::Worker => &["claude", "gemini"],
+        Role::SpecWriter | Role::Architect | Role::Orchestrator | Role::TeamLead | Role::Integrator | Role::Critic | Role::Monitor => &["claude"],
+    }
+}
+
+/// The entries a role gets when `campaign.toml` does not set it (`/model default`).
+pub fn default_role_entries(role: Role) -> Vec<RoleEntry> {
+    default_role_spec(role)
+        .iter()
+        .map(|s| s.parse().expect("built-in role defaults parse"))
+        .collect()
+}
+
 fn parse_role_spec(role: Role, spec: Option<RawRoleSpec>, default: &[&str]) -> Result<Vec<RoleEntry>> {
     let raw_list: Vec<String> = match spec {
         Some(RawRoleSpec::Single(s)) => vec![s],
@@ -419,43 +437,43 @@ pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
     let mut roles = BTreeMap::new();
     roles.insert(
         Role::SpecWriter,
-        parse_role_spec(Role::SpecWriter, raw.roles.spec_writer, &["claude"])?,
+        parse_role_spec(Role::SpecWriter, raw.roles.spec_writer, default_role_spec(Role::SpecWriter))?,
     );
     roles.insert(
         Role::Architect,
-        parse_role_spec(Role::Architect, raw.roles.architect, &["claude"])?,
+        parse_role_spec(Role::Architect, raw.roles.architect, default_role_spec(Role::Architect))?,
     );
     roles.insert(
         Role::Orchestrator,
-        parse_role_spec(Role::Orchestrator, raw.roles.orchestrator, &["claude"])?,
+        parse_role_spec(Role::Orchestrator, raw.roles.orchestrator, default_role_spec(Role::Orchestrator))?,
     );
     roles.insert(
         Role::TeamLead,
-        parse_role_spec(Role::TeamLead, raw.roles.team_lead, &["claude"])?,
+        parse_role_spec(Role::TeamLead, raw.roles.team_lead, default_role_spec(Role::TeamLead))?,
     );
     roles.insert(
         Role::Integrator,
-        parse_role_spec(Role::Integrator, raw.roles.integrator, &["claude"])?,
+        parse_role_spec(Role::Integrator, raw.roles.integrator, default_role_spec(Role::Integrator))?,
     );
     roles.insert(
         Role::Critic,
-        parse_role_spec(Role::Critic, raw.roles.critic, &["claude"])?,
+        parse_role_spec(Role::Critic, raw.roles.critic, default_role_spec(Role::Critic))?,
     );
     roles.insert(
         Role::Monitor,
-        parse_role_spec(Role::Monitor, raw.roles.monitor, &["claude"])?,
+        parse_role_spec(Role::Monitor, raw.roles.monitor, default_role_spec(Role::Monitor))?,
     );
     roles.insert(
         Role::Reviewer,
-        parse_role_spec(Role::Reviewer, raw.roles.reviewer, &["gemini"])?,
+        parse_role_spec(Role::Reviewer, raw.roles.reviewer, default_role_spec(Role::Reviewer))?,
     );
     roles.insert(
         Role::Falsifier,
-        parse_role_spec(Role::Falsifier, raw.roles.falsifier, &["gemini"])?,
+        parse_role_spec(Role::Falsifier, raw.roles.falsifier, default_role_spec(Role::Falsifier))?,
     );
     roles.insert(
         Role::Worker,
-        parse_role_spec(Role::Worker, raw.roles.worker, &["claude", "gemini"])?,
+        parse_role_spec(Role::Worker, raw.roles.worker, default_role_spec(Role::Worker))?,
     );
 
     let def_budget = Budget::default();
@@ -530,6 +548,33 @@ pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
         budget,
         policy,
     })
+}
+
+/// Write the built-in split for every role into `campaign.toml` (`/model default`).
+pub fn reset_roles(campaign_dir: impl AsRef<Path>) -> Result<()> {
+    for r in Role::ALL {
+        set_role(campaign_dir.as_ref(), r, &default_role_entries(r))?;
+    }
+    Ok(())
+}
+
+/// One line per backend naming the roles it serves by default, for `/model default`.
+pub fn default_split_summary() -> String {
+    let names = |pred: &dyn Fn(&[RoleEntry]) -> bool| {
+        Role::ALL
+            .into_iter()
+            .filter(|&r| pred(&default_role_entries(r)))
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let only = |b: BackendKind| move |es: &[RoleEntry]| es.len() == 1 && es[0].backend == b;
+    format!(
+        "claude: {}; gemini: {}; both: {}",
+        names(&only(BackendKind::Claude)),
+        names(&only(BackendKind::Gemini)),
+        names(&|es: &[RoleEntry]| es.len() > 1)
+    )
 }
 
 pub fn set_role(campaign_dir: impl AsRef<Path>, role: Role, entries: &[RoleEntry]) -> Result<()> {
@@ -778,6 +823,33 @@ reviewer = ["claude:sonnet", "gemini"]
             host.display()
         ));
         assert!(err.message.contains("package"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn reset_roles_restores_the_builtin_split() {
+        let tmp = TempDir::new().unwrap();
+        let host = make_host(&tmp);
+        let camp = tmp.path().join("camp");
+        fs::create_dir_all(&camp).unwrap();
+        let base = format!("id = \"abc\"\nhost_project = \"{}\"\n", host.display());
+        fs::write(camp.join("campaign.toml"), &base).unwrap();
+        let defaults = load(&camp).unwrap().roles;
+
+        let mut all_claude = format!("# keep me\n{base}\n[roles]\n");
+        for r in Role::ALL {
+            all_claude.push_str(&format!("{r} = \"claude:opus\"\n"));
+        }
+        fs::write(camp.join("campaign.toml"), &all_claude).unwrap();
+        assert_ne!(load(&camp).unwrap().roles, defaults);
+
+        reset_roles(&camp).unwrap();
+        assert_eq!(load(&camp).unwrap().roles, defaults);
+        assert!(fs::read_to_string(camp.join("campaign.toml")).unwrap().contains("# keep me"));
+        assert_eq!(
+            default_split_summary(),
+            "claude: spec_writer, architect, orchestrator, team_lead, integrator, critic, monitor; \
+             gemini: reviewer, falsifier; both: worker"
+        );
     }
 
     #[test]

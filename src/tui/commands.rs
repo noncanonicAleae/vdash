@@ -12,6 +12,8 @@ pub enum Cmd {
     Help,
     Status,
     Model(Option<(String, String)>),
+    /// `/model default`: restore the built-in Claude/Gemini split for every role.
+    ModelDefault,
     Login(Option<String>),
     Search(String),
     Btw(String),
@@ -44,7 +46,7 @@ pub enum Cmd {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("help", "", "list commands"),
     ("status", "", "campaign summary"),
-    ("model", "[<role|all> <backend>[:<model>]]", "show or change which backend and model serves each role"),
+    ("model", "[default | <role|all> <backend>[:<model>]]", "show or change which backend and model serves each role"),
     ("login", "[claude|gemini]", "sign in to your Claude or Gemini account"),
     ("search", "<query>", "search Mathlib, campaign Lean files, and online Loogle docs"),
     ("btw", "<question>", "ask the monitor a side question; work continues"),
@@ -160,6 +162,7 @@ pub fn parse(line: &str) -> Result<Input, String> {
         "status" => none(Cmd::Status),
         "model" | "models" => match words.as_slice() {
             [] | ["list"] => Ok(Cmd::Model(None)),
+            ["default"] => Ok(Cmd::ModelDefault),
             [backend @ ("claude" | "gemini"), model] => {
                 let entry = if let Some(rest) = model.strip_prefix(&format!("{backend}:")) {
                     format!("{backend}:{rest}")
@@ -268,7 +271,7 @@ pub fn complete(line: &str, agents: &[String]) -> Vec<String> {
     match parts.as_slice() {
         [prefix] => COMMANDS.iter().filter(|(n, _, _)| n.starts_with(prefix)).map(|(n, _, _)| format!("/{n}")).collect(),
         ["login", b] => BACKENDS.iter().filter(|x| x.starts_with(b)).map(|x| format!("/login {x}")).collect(),
-        ["model", role] => ROLES.iter().filter(|r| r.starts_with(role)).map(|r| format!("/model {r}")).collect(),
+        ["model", role] => std::iter::once(&"default").chain(ROLES).filter(|r| r.starts_with(role)).map(|r| format!("/model {r}")).collect(),
         ["model", backend @ ("claude" | "gemini"), model_prefix] => models_for_backend(backend)
             .iter()
             .filter(|m| m.starts_with(model_prefix))
@@ -320,6 +323,7 @@ mod tests {
         assert_eq!(parse("/help").unwrap(), Input::Cmd(Cmd::Help));
         assert_eq!(parse("/model").unwrap(), Input::Cmd(Cmd::Model(None)));
         assert_eq!(parse("/model list").unwrap(), Input::Cmd(Cmd::Model(None)));
+        assert_eq!(parse("/model default").unwrap(), Input::Cmd(Cmd::ModelDefault));
         assert_eq!(parse("/model worker gemini:gemini-4-argon-high").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini:gemini-4-argon-high".into())))));
         assert_eq!(parse("/model worker gemini gemini-4-argon-high").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini:gemini-4-argon-high".into())))));
         assert_eq!(parse("/model claude opus").unwrap(), Input::Cmd(Cmd::Model(Some(("claude".into(), "claude:opus".into())))));
@@ -342,7 +346,7 @@ mod tests {
 
     #[test]
     fn errors_name_the_usage_and_suggest() {
-        assert_eq!(parse("/model worker").unwrap_err(), "usage: /model [<role|all> <backend>[:<model>]]");
+        assert_eq!(parse("/model worker").unwrap_err(), "usage: /model [default | <role|all> <backend>[:<model>]]");
         assert!(parse("/model wrker claude").unwrap_err().contains("unknown role"));
         assert!(parse("/model worker gpt").unwrap_err().contains("unknown backend"));
         assert_eq!(parse("/btw").unwrap_err(), "usage: /btw <question>");
@@ -358,6 +362,7 @@ mod tests {
     fn completion() {
         assert_eq!(complete("/st", &[]), vec!["/status", "/stop"]);
         assert_eq!(complete("/model wo", &[]), vec!["/model worker"]);
+        assert_eq!(complete("/model de", &[]), vec!["/model default"]);
         assert_eq!(complete("/model worker g", &[]), vec!["/model worker gemini"]);
         assert_eq!(complete("/model worker claude:o", &[]), vec!["/model worker claude:opus"]);
         assert_eq!(complete("/model worker gemini gemini-3.8-flash-h", &[]), vec!["/model worker gemini gemini-3.8-flash-high"]);

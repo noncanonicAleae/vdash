@@ -354,7 +354,7 @@ proof strategy") and is also appended to `STRATEGY.md`.
 |---|---|
 | `/help` | list commands |
 | `/status` | the plain summary |
-| `/model` | show the role → backend:model table; `/model <role\|all> <backend>[:<model>]` changes it, live |
+| `/model` | show the role → backend:model table; `/model <role\|all> <backend>[:<model>]` changes it, live; `/model default` restores the §3 split for every role |
 | `/btw <question>` | a side question answered by the read-only monitor agent from state, logs and bulletin, without disturbing the running work |
 | `/spec`, `/review`, `/approve` | draft or revise the spec, rerun reviewers, approve |
 | `/prove`, `/pause`, `/resume`, `/stop` | control the engine |

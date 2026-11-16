@@ -1627,3 +1627,8 @@ Gemini owns M8-03..M8-06.
   `/amend approve N --accept-weakening`), is recorded `weakening_accepted`, and is
   flagged in `amend list`; `reject` now also dismisses escalations. Tests in
   `tests/amend.rs` (both suites) and `tui::commands`.
+- 2026-11-16 (Claude): `/model default` (and `vdash model default`) writes the built-in
+  DESIGN §3 role split back for every role, live through `set_role` when an engine runs.
+  The split now lives in one place, `config::default_role_spec`, used by `load` too.
+  Tests: `config::tests::reset_roles_restores_the_builtin_split`, `tui::commands` parse
+  and completion.

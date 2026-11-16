@@ -678,6 +678,24 @@ impl Session {
                 };
                 self.app.say(Kind::Good, "model", format!("{target_desc} → {entry} ({how})"));
             }
+            Cmd::ModelDefault => {
+                let live = self.app.engine.is_some();
+                for r in Role::ALL {
+                    let es = config::default_role_entries(r);
+                    if live {
+                        let entries = es.iter().map(|e| e.to_string()).collect();
+                        let _ = events::send(&self.ctx, &Control::SetRole { role: r.to_string(), entries });
+                    } else if let Err(e) = config::set_role(&self.ctx.campaign.root, r, &es) {
+                        self.app.say(Kind::Bad, "model", e.message);
+                        return false;
+                    }
+                }
+                if let Ok(cfg) = config::load(&self.ctx.campaign.root) {
+                    self.ctx.cfg = cfg;
+                }
+                let how = if live { "sent to the engine; it applies to the next attempt of every agent" } else { "saved to campaign.toml" };
+                self.app.say(Kind::Good, "model", format!("default split restored ({how}). {}", config::default_split_summary()));
+            }
             Cmd::Login(None) => {
                 self.busy("login");
                 self.runner.vdash("login", "login", vec!["login".into()]);

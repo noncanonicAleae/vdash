@@ -112,7 +112,8 @@ enum Commands {
     },
     /// Show or change which backend and model serves each role
     Model {
-        /// Optional `<role|all|claude|gemini> <backend[:model]|model>`
+        /// Optional `default` (restore the built-in Claude/Gemini split) or
+        /// `<role|all|claude|gemini> <backend[:model]|model>`
         args: Vec<String>,
     },
     /// Search Mathlib, campaign Lean files, and online Loogle documentation
@@ -348,7 +349,7 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(vdash::tui::commands::Input::Cmd(vdash::tui::commands::Cmd::Model(None))) => {
                     for r in config::Role::ALL {
                         let es: Vec<String> = ctx.cfg.entries_for(r).iter().map(|e| e.to_string()).collect();
-                        println!("{:<14} {}", r, es.join(", "));
+                        println!("{:<14} {}", r.to_string(), es.join(", "));
                     }
                     println!("\nAvailable models:");
                     println!("  claude   {}", vdash::tui::commands::CLAUDE_MODELS.join(", "));
@@ -380,6 +381,20 @@ fn run(cli: Cli) -> Result<()> {
                         }
                     }
                     println!("vdash: {role} → {entry}");
+                    Ok(())
+                }
+                Ok(vdash::tui::commands::Input::Cmd(vdash::tui::commands::Cmd::ModelDefault)) => {
+                    if vdash::events::engine_running(&ctx).is_some() {
+                        for r in config::Role::ALL {
+                            let entries = config::default_role_entries(r).iter().map(|e| e.to_string()).collect();
+                            vdash::events::send(&ctx, &vdash::events::Control::SetRole { role: r.to_string(), entries })?;
+                        }
+                        println!("vdash: default split sent to the running engine");
+                    } else {
+                        config::reset_roles(&ctx.campaign.root)?;
+                        println!("vdash: default split restored in campaign.toml");
+                    }
+                    println!("{}", config::default_split_summary());
                     Ok(())
                 }
                 Err(e) => Err(VdashError::new(2, e)),

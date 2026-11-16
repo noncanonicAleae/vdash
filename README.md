@@ -158,6 +158,7 @@ Run `vdash` with no subcommand inside a campaign to open the terminal UI.
 | `/model <role\|all> <backend>[:<model>]` | Assign a role (or `all` roles) to a backend and optional model |
 | `/model <role\|all> <backend> <model>` | Three-argument shorthand, e.g. `/model worker claude opus` |
 | `/model <claude\|gemini> <model>` | Set the model for every role currently assigned to that backend |
+| `/model default` | Restore the default split (Claude: planning, leads, integrator, critic, monitor; Gemini: reviewer, falsifier; workers on both). Also `vdash model default` |
 | `/search <query>` | Search local Mathlib/campaign `.lean` files and online Loogle documentation |
 | `/btw <question>` | Ask the read-only Monitor agent a side question while work continues |
 | `/spec [feedback]` | Draft the spec from `sources/BRIEF.md`, or revise it with feedback |
