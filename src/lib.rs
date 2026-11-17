@@ -18,6 +18,7 @@ pub mod prompts;
 pub mod schemas;
 pub mod skills;
 pub mod amend;
+pub mod escalation;
 pub mod engine;
 pub mod spec;
 pub mod status;

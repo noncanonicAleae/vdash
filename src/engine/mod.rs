@@ -104,17 +104,22 @@ impl<'p> Engine<'p> {
                         Ok(()) => self.note(round, format!("role {role} now uses {}", entries.join(", "))),
                         Err(e) => self.note(round, format!("could not set role {role}: {}", e.message)),
                     },
-                    Control::Guidance { text } => {
-                        self.update(|s| s.pending_guidance.push(text.clone()))?;
-                        let p = self.ctx.campaign.strategy_file();
-                        let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
-                        if !cur.is_empty() && !cur.ends_with('\n') {
-                            cur.push('\n');
+                    Control::Guidance { text } => self.add_guidance(round, &text)?,
+                    Control::ResolveEscalation { ns, answer } => {
+                        match crate::escalation::resolve(&self.ctx, round, &ns, &answer, "user") {
+                            Ok(r) => {
+                                for rel in &r.rels {
+                                    self.own(rel);
+                                }
+                                let list = r.closed.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ");
+                                let how = if r.guidance.is_empty() { "dismissed" } else { "answered" };
+                                self.note(round, format!("escalation {list} {how} by the user"));
+                                if !r.guidance.is_empty() {
+                                    self.add_guidance(round, &r.guidance)?;
+                                }
+                            }
+                            Err(e) => self.note(round, format!("could not resolve escalation: {}", e.message)),
                         }
-                        cur.push_str(&format!("\n## Guidance ({})\n\n{}\n", util::now_iso(), text.trim()));
-                        std::fs::write(&p, cur).map_err(|e| VdashError::io_path(&p, e))?;
-                        self.own("STRATEGY.md");
-                        self.note(round, "guidance queued for the orchestrator's next call");
                     }
                     Control::AmendDecision { n, approve, accept_weakening } => {
                         use crate::amend::Decision;
@@ -141,6 +146,21 @@ impl<'p> Engine<'p> {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    /// Queue guidance for the orchestrator's next call and append it to STRATEGY.md.
+    fn add_guidance(&mut self, round: u32, text: &str) -> Result<()> {
+        self.update(|s| s.pending_guidance.push(text.to_string()))?;
+        let p = self.ctx.campaign.strategy_file();
+        let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
+        if !cur.is_empty() && !cur.ends_with('\n') {
+            cur.push('\n');
+        }
+        cur.push_str(&format!("\n## Guidance ({})\n\n{}\n", util::now_iso(), text.trim()));
+        std::fs::write(&p, cur).map_err(|e| VdashError::io_path(&p, e))?;
+        self.own("STRATEGY.md");
+        self.note(round, "guidance queued for the orchestrator's next call");
+        Ok(())
     }
 
     fn set_role(&mut self, role: &str, entries: &[String]) -> Result<()> {

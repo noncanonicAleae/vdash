@@ -100,7 +100,8 @@ fn m6_02_early_rejections_and_escalation_without_lean() {
     assert!(r3.critic_reason.contains("more than 15 lines"));
     assert_eq!(fb.count(Role::Critic), 0);
 
-    // 4. Escalation: critic returns `escalate` -> writes both amendments/004-*.md and escalations/004-*.md
+    // 4. Escalation: critic returns `escalate` -> writes amendments/004-*.md and the
+    // campaign's first escalation, escalations/001-*.md (own numbering, M6-04).
     fb.reply(
         Role::Critic,
         json!({
@@ -127,6 +128,10 @@ fn m6_02_early_rejections_and_escalation_without_lean() {
     assert_eq!(fb.count(Role::Critic), 1);
     assert!(ctx.campaign.root.join(r4.rel_path()).is_file());
     assert!(ctx.campaign.root.join(r4.escalation_rel_path()).is_file());
+    assert!(r4.escalation_rel_path().starts_with("escalations/001-"), "{}", r4.escalation_rel_path());
+    let esc = vdash::escalation::list(&ctx);
+    assert_eq!(esc.len(), 1);
+    assert_eq!((esc[0].n, esc[0].amendment_n(), esc[0].is_open()), (1, Some(4), true));
 
     // Verify events emitted include both `amendment` and `escalation`
     let evs = events::tail(&ctx.campaign.events_file(), 20).0;
@@ -135,7 +140,7 @@ fn m6_02_early_rejections_and_escalation_without_lean() {
         .any(|e| e.kind == "amendment" && e.u64("n") == Some(4) && e.str("status") == "escalated"));
     assert!(evs
         .iter()
-        .any(|e| e.kind == "escalation" && e.u64("n") == Some(4)));
+        .any(|e| e.kind == "escalation" && e.u64("n") == Some(1)));
 
     // An escalated proposal is not approved by a plain `approve`: it needs
     // `--accept-weakening`. A human can dismiss it with `reject`.
@@ -148,6 +153,7 @@ fn m6_02_early_rejections_and_escalation_without_lean() {
     amend::reject_cmd(&ctx, 4).unwrap();
     assert_eq!(amend::load_record(&ctx, 4).unwrap().status, "rejected");
     assert!(ctx.campaign.root.join(r4.escalation_rel_path()).is_file());
+    assert_eq!(vdash::escalation::list(&ctx)[0].status, "rejected");
 
     // Verify critic prompt contains NO content from Proof/ or Solution.lean
     let calls = fb.calls.lock().unwrap();

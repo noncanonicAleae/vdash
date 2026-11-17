@@ -175,6 +175,8 @@ Run `vdash` with no subcommand inside a campaign to open the terminal UI.
 | `/amend approve <N>` / `reject <N>` | Apply or reject pending amendment `#N`; `reject` also dismisses an escalation |
 | `/amend approve <N> --accept-weakening` | Apply an escalated proposal, knowingly accepting a weaker guarantee |
 | `/amend propose <file.json>` | Submit an amendment JSON proposal to the Critic |
+| `/escalations [all \| N]` | List open escalations (questions for you); `all` adds closed ones, `N` shows one in full. Also `vdash escalations` |
+| `/resolve <N[-M][,…]> [answer]` | Close escalations. With an answer, it also goes to the orchestrator as guidance; without one, it is dismissed. Ranges work: `/resolve 1-15`. Also `vdash resolve` |
 | `/agents` | List agents currently running with elapsed times |
 | `/logs <agent-id>` | Inspect one agent's full JSON reply, cost, and transcript path (e.g. `/logs worker-3`) |
 | `/bulletin` | Show the last 20 shared team notices from `bulletin.md` |
@@ -193,7 +195,7 @@ Agents edit Lean files in place, so by default you only see their summaries. Wit
 - **`Enter`**: Send command or plain-text message (or accept selected completion).
 - **`Tab` / `Shift-Tab`**: Autocomplete slash commands, role names, backend names, model names, and agent IDs.
 - **`↑` / `↓`**: Navigate command history (or move through the autocomplete popup).
-- **`PgUp` / `PgDn`** (or mouse wheel): Scroll the transcript.
+- **`PgUp` / `PgDn`** (or mouse wheel): Scroll the transcript. The app captures the mouse for the wheel; hold `Shift` while dragging to select text.
 - **`Ctrl-A` / `Ctrl-E` / `Ctrl-W` / `Ctrl-U`**: Move to start/end of line, delete previous word, or clear input.
 - **`Ctrl-C` twice** (or **`Ctrl-D`**): Quit the TUI (leaving any background engine running).
 

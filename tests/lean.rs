@@ -159,13 +159,87 @@ fn m1_04_incremental_build_cache_failure_and_sorry() {
     let defs_res = &rep4.results["Apc.Spec.Defs"];
     assert!(!defs_res.ok);
     assert!(defs_res.diagnostics.iter().any(|d| d.severity == "error" && d.line >= 1));
-    assert!(!build_dir.join("Apc/Spec/Defs.olean").exists());
+    // The olean stays (a concurrent build may be reading it); the key is gone, so it
+    // is never a cache hit.
     assert!(!build_dir.join("Apc/Spec/Defs.olean.key").exists());
+    assert!(!build_dir.join("Apc/Spec/Defs.olean.diag.json").exists());
+    assert!(!build_dir.join("Apc/Challenge.olean.key").exists());
+
+    // Fixing it rebuilds Defs (not a stale cache hit) and its dependent.
+    fs::write(&defs_path, &orig_defs).unwrap();
+    let rep5 = lean::build::build(&ctx, &tree, &build_dir, None).unwrap();
+    assert!(rep5.ok);
+    assert!(!rep5.results["Apc.Spec.Defs"].cached);
+    assert!(!rep5.results["Apc.Challenge"].cached);
 
     let chal_res = &rep4.results["Apc.Challenge"];
     assert!(!chal_res.ok);
     assert_eq!(chal_res.diagnostics.len(), 1);
     assert_eq!(chal_res.diagnostics[0].text, "dependency Apc.Spec.Defs failed");
+}
+
+/// Parallel workers' checks share one build directory. On a cold cache, concurrent
+/// builds must not delete each other's oleans while a dependent compiles against
+/// them (quartic-query-separation round 6: "object file … QSpec.olean does not
+/// exist"), and each module is compiled once, not once per caller.
+#[test]
+fn m1_04_concurrent_builds_share_the_cache_safely() {
+    require_lean!();
+
+    let tmp = TempDir::new().unwrap();
+    let camp_dir = tmp.path().join("isort_camp");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let host = common::real_host_project();
+    paths::init_campaign(&camp_dir, &host, Some("isort"), &[BackendKind::Claude]).unwrap();
+
+    let mut ctx = Ctx::for_test(&camp_dir, &state_dir).unwrap();
+    // Fewer slots than callers, so some callers start late, as in a real round.
+    ctx.cfg.budget.max_parallel_lean = 2;
+    let tree = ctx.campaign.lean_dir();
+    let build_dir = ctx.campaign.build_work_dir();
+    let targets = ["Apc.Challenge".to_string()];
+
+    let reports: Vec<lean::build::BuildReport> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|_| s.spawn(|| lean::build::build(&ctx, &tree, &build_dir, Some(&targets)).unwrap()))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    for rep in &reports {
+        let bad: Vec<String> = rep
+            .results
+            .values()
+            .filter(|r| !r.ok)
+            .map(|r| format!("{}: {:?}", r.module, r.diagnostics.iter().map(|d| &d.text).collect::<Vec<_>>()))
+            .collect();
+        assert!(rep.ok, "a concurrent build failed: {bad:?}");
+    }
+    let modules = reports[0].results.len();
+    let compiles: usize = reports.iter().map(|r| r.results.values().filter(|m| !m.cached).count()).sum();
+    assert_eq!(compiles, modules, "each module must be compiled exactly once across all callers");
+    for m in reports[0].results.keys() {
+        let olean = build_dir.join(m.replace('.', "/")).with_extension("olean");
+        assert!(olean.is_file(), "{} is missing after the builds", olean.display());
+    }
+    let leftovers: Vec<_> = walk(&build_dir).into_iter().filter(|p| p.extension().is_some_and(|e| e == "tmp")).collect();
+    assert!(leftovers.is_empty(), "temporary outputs left behind: {leftovers:?}");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 #[test]

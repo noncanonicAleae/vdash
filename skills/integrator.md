@@ -10,11 +10,15 @@ modules.
   `lean/Apc/Solution.lean`.
 - Run `vdash check <file>` and `vdash axioms <file> <Name>...`. If `vdash` is not found in your sandbox (exit 127), do not retry it or try `lean`/`lake` or `BypassSandbox`; carefully verify imports and types by reading the files, and the engine will check `Apc.Solution` after your reply.
 - Search Mathlib and online Loogle documentation with `vdash search "<query>"` or web search tools.
-- Change files with your edit and write tools. Run `vdash check <file>`,
-  `vdash axioms <file> <Name>...` and `vdash search "<query>"` from the campaign root. To read, use your read tool or `cat`, `head`, `tail`, `ls`,
-  `wc`, `grep`; chain or pipe them only with each other. Never `cd`: give every path from the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`); a `cd` followed by a `..` path is always denied. Change files **only** with
-  your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
-  `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
+- Change files with your edit and write tools. The shell runs only these commands,
+  from the campaign root: `vdash check <file>`, `vdash axioms <file> <Name>...`,
+  `vdash search "<query>"`, and `cat`, `head`, `tail`, `ls`, `wc`, `grep`, `rg`,
+  `echo`. You may chain or pipe them with each other (`vdash check f; echo
+  "exit=$?"`, `ls d; echo ---; grep -n x f`, `cat f | head`). Give every path from
+  the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`);
+  never `cd`. These are always denied and waste your turn: shell writes (`cat > f`,
+  heredocs, `>`, `sed -i`, `cp`, `touch`, `python3`), a prefix such as `timeout`,
+  `vdash --help`, `lean`, `lake`, `find`, `sed`, `which`. Anything else is denied.
 
 ## You must not
 - Edit spec files or `Challenge.lean`.
@@ -24,7 +28,8 @@ modules.
 - Leave `sorry` anywhere in `lean/Apc/Proof/Lib/`.
 
 ## Procedure
-1. Read the list of verified lemmas and the slowest modules.
+1. Read the list of verified lemmas, the slowest modules and `<solution_check>`,
+   the engine's own `vdash check` of `Solution.lean` from just before your turn.
 2. Move verified lemmas into `lean/Apc/Proof/Lib/<Topic>.lean`, update imports so
    every file that used them still compiles, and make `Solution.lean` import the
    library modules it needs.

@@ -118,6 +118,9 @@ M4 interactive app · M5 spec phase · M6 amendments · M7 later · status log.
   `cd a && grep -r x ..`) is denied. Skills say never `cd`; use root-relative paths.
   In the `sequent-calculus` run after the C13 fix, 3 of 21 agents hit a denial (two
   shell writes, one `cd …; cat ../…`); none lost its turn.
+- C15. (probed 2026-11-17, `haiku`, flags as `Profile::Lean` plus `Bash(echo *)`)
+  `cat f; echo "exit=$?"`, `ls d; echo ---; wc -l f` and `cat f 2>&1 | head` run;
+  `echo x > g` and `echo $(touch h)` are denied and write nothing.
 - C13. (probed 2026-11-15, `haiku`, flags as `Profile::Lean`) With allow rules
   `Bash(cat *)`, `Bash(head *)`, `Bash(sed -n *)`, `Bash(ls *)`, `Bash(grep *)`:
   `cat f`, `head -2 f`, `sed -n 2p f`, `cd sub && cat f` and `cat f | grep x` run;
@@ -662,17 +665,27 @@ agent and between stages), acts, and moves each to `inbox/done/`.
     `<olean>.key`. A module is skipped iff its olean exists and the stored key matches.
   - Compile command (F2, F4): `lean --json -R <tree> -o <build>/Apc/X.olean <file>`
     with `LEAN_PATH`, timeout `lean_timeout_s`, holding a slot.
-  - On failure (F3): delete the olean and key if present; mark every transitive
-    dependent `ok = false` with one diagnostic `dependency <M> failed`, without
-    running Lean on it.
+  - Shared cache: several builds (parallel workers' checks, in one process or many)
+    use one build directory. Each module's cache check and compile run under an
+    exclusive `flock` on `<olean>.lock` (taken before the slot; a slot holder never
+    waits for a module lock). Lean writes to `<olean>.<pid>-<n>.tmp`, which is renamed
+    over the olean on success, so a reader never finds the olean missing or partial.
+  - On failure (F3): invalidate the entry (delete `<olean>.key` and `.diag.json`, under
+    its lock) but keep the old olean, since another build may be compiling against it;
+    a keyless olean is never a cache hit. Mark every transitive dependent `ok = false`
+    with one diagnostic `dependency <M> failed`, without running Lean on it, and
+    invalidate its entry the same way.
   - Timeout → `ok = false`, diagnostic `timed out after <N>s`.
   - Parse stdout lines as JSON (F4); a non-JSON line becomes an `information`
     diagnostic.
   - Concurrency: level by level, with `std::thread::scope`; the slots bound it.
   - Tests (Lean): clean build of isort Spec; second build fully cached; touching
     `Defs.lean` rebuilds it and its dependents only; a syntax error yields
-    `ok = false`, a located diagnostic, no olean, and dependents marked failed;
+    `ok = false`, a located diagnostic, no key, and dependents marked failed;
     `sorry` gives `kind == "hasSorry"` with `ok = true`.
+    Eight concurrent builds of `Apc.Challenge` on a cold cache with 2 slots all succeed,
+    compile each module exactly once in total, and leave no `.tmp` file
+    (`m1_04_concurrent_builds_share_the_cache_safely`).
 
 - [x] **M1-05 `vdash check <file>`**
   - Build the file's module (and deps) into `.build/work`. Print diagnostics as
@@ -1204,6 +1217,19 @@ agent and between stages), acts, and moves each to `inbox/done/`.
   - **Live exit test**: isort with the full team and both backends reaches all four
     accepted; killing the engine mid-round and rerunning `vdash prove` completes.
 
+- [x] **M3-09 Infrastructure errors are not the worker's problem** (user request 2026-11-17)
+  - `lean::build::build` reruns the build (up to 2 more times) when a module failed
+    with an infrastructure error and nothing else: `object file … does not exist`,
+    an unreadable olean (`failed to read file … .olean`, `invalid header`), or Lean
+    killed by a signal. Cached modules stay cached, so a rerun rebuilds only what is
+    missing. `BuildReport.retries` counts the reruns.
+  - `run_worker_checked`: if the check still fails with an infrastructure error only,
+    do not send it to the worker; post an engine bulletin naming the file and the
+    first error, and stop retrying that worker.
+  - Tests (Lean): deleting a dependency's olean after it was cached (key kept), then
+    checking a dependent, succeeds after one rerun; a real elaboration error is not
+    rerun. Unit: the infrastructure classifier on sample diagnostics.
+
 ---
 
 ## M4. The interactive app
@@ -1389,6 +1415,43 @@ agent and between stages), acts, and moves each to `inbox/done/`.
     `isort_fixes_sorted` stated for a `Sorted` that demands strict `<`) gets an
     amendment proposed and applied; a hand-fed weakening proposal is escalated.
 
+- [x] **M6-04 Escalation lifecycle** (user request 2026-11-17)
+  - One numbering for `escalations/`: the next number is the largest `NNN-` prefix
+    plus one (never a file count). An escalated amendment gets its own escalation
+    number; `AmendmentRecord.escalation` stores the file's path (old records fall back
+    to `escalations/<amendment N>-<slug>.md`).
+  - Every escalation file carries `- status: open|resolved|applied|rejected`; a file
+    without the line is `open`. `escalation::list` parses number, round, from, status,
+    the amendment link and a one-line summary.
+  - `escalation::resolve(ctx, ns, answer, by)`: sets `resolved` and appends
+    `## Resolution (<time>, by <who>)` with the answer, or "Dismissed without an
+    answer". An amendment-backed escalation is refused (code 2) with a pointer to
+    `/amend approve N --accept-weakening` / `/amend reject N`; applying or rejecting
+    that amendment sets its escalation to `applied` / `rejected`.
+  - `vdash escalations [--all]`, `vdash resolve <N[-M][,…]> [answer…]`; app
+    `/escalations [all]`, `/resolve <N[-M][,…]> [answer]`. With an engine running,
+    send `resolve_escalation {ns, answer}`; the engine applies it at its next
+    checkpoint and records the files as engine-written. Otherwise apply directly.
+    A non-empty answer also becomes guidance: `Answer to escalation #N (<from>, round
+    <r>: <summary>): <answer>`.
+  - The orchestrator's `escalations` section lists only open escalations, each as
+    `#N (round r, from X): summary`.
+  - Tests (fake): numbering after a gap and with an amendment escalation; resolve
+    with and without an answer; ranges; refusal on an amendment escalation; applying
+    the amendment closes its escalation; online resolve goes through the inbox and
+    is applied by `checkpoint`; the orchestrator prompt drops resolved ones.
+
+- [x] **M6-05 Escalation noise** (user request 2026-11-17)
+  - The team lead's summary request carries `<open_escalations>`; `team_lead.md`
+    says to escalate only questions about the mathematics or the spec that a human
+    must decide, never tooling, build, sandbox or permission problems (those go in
+    `notes`), and never to repeat an open escalation.
+  - `write_lead` skips an escalation whose word set (lowercase, alphanumeric tokens
+    of 3+ characters) has Jaccard similarity ≥ 0.6 with an open escalation or one
+    written earlier in the same stage, and emits a note naming the duplicate.
+  - Tests: a reworded repeat is skipped; quartic-query-separation's 023 and 024 (two
+    different questions on one paper) are both kept.
+
 ---
 
 ## M7. Later
@@ -1430,6 +1493,13 @@ Gemini owns M8-03..M8-06.
   Claude aliases and ids), accepts `<role|all> <backend>[:<model>]` and a backend-wide
   model, completes model names; `vdash model` for scripts.
 - [x] **M8-06 Branding** (Gemini). ASCII-art logo at startup, ⊢ mark in the header.
+- [x] **M8-07 Claude shell denials** (user request 2026-11-17). Fact C15. Add
+  `Bash(echo *)` to the read-only shell rules so `vdash check f; echo "exit=$?"` and
+  `ls d; echo ---; cat f` run (the commonest denial in quartic-query-separation).
+  `worker.md`, `integrator.md` and `team_lead.md` list the exact command shapes that
+  run and those that never do (`timeout …`, `python3`, `sed -i`, `cat > f`,
+  `vdash --help`). The integrator's request carries the current `vdash check` result
+  of `Apc.Solution` so it starts from facts. Test: the argv contains the rule.
 
 ---
 
@@ -1665,3 +1735,32 @@ Gemini owns M8-03..M8-06.
   and overlays `SetRole` messages still in the inbox, marked pending (the pool already
   routes new calls by them). Test:
   `tui::tests::model_table_shows_pending_then_saved_live_changes`.
+- 2026-11-17 (Claude): Fixed a race in the shared build cache (M1-04). Parallel
+  workers' engine checks build into one `.build/work`; `compile_single_module`
+  deleted a module's olean before recompiling it and on failure, and `build`
+  deleted dependents' oleans, all without a lock, so on a cold cache concurrent
+  checks deleted oleans other checks were compiling against.
+  quartic-query-separation round 6 got false "object file … Lib/QSpec.olean does
+  not exist" errors on four goals, and six of its escalations followed from them.
+  Now: a per-module `flock` covers the cache check and the compile, Lean writes to a
+  temp path that is renamed into place, and failure only invalidates the key.
+  Test: `m1_04_concurrent_builds_share_the_cache_safely` (failed before the fix
+  with exactly that error); `m1_04_incremental_build_cache_failure_and_sorry`
+  updated (no key after failure; fixing the file rebuilds it).
+- 2026-11-17 (Claude): M6-04, M6-05, M3-09, M8-07 (user request). New
+  `src/escalation.rs`: one numbering for `escalations/` (lead escalations had been
+  numbered by file count, amendment escalations by amendment number, so two files could
+  both be "escalation 3"); a `- status:` line per file; `vdash escalations` /
+  `vdash resolve` and `/escalations` / `/resolve` (`Control::ResolveEscalation` with an
+  engine running); an answer becomes guidance; orchestrator and leads see only open
+  escalations; a lead escalation repeating an open one is dropped with a note.
+  `team_lead.md` forbids escalating tooling problems. `build` reruns a build that
+  failed only on infrastructure errors (missing or unreadable olean, Lean killed),
+  and `run_worker_checked` posts such a failure to the bulletin instead of sending it
+  to the worker. `Bash(echo *)` added to the Claude shell rules (fact C15); the worker
+  and integrator skills list the command shapes that run; the integrator gets the
+  engine's check of `Solution.lean`. Tests: `escalation::tests::*`,
+  `resolve_escalation_through_the_engine_inbox`, `infra_classifier`,
+  `tests/build_retry.rs`, updated `m6_02_early_rejections_and_escalation_without_lean`,
+  parser and argv cases. Checked read-only against quartic-query-separation's 30
+  existing escalations (all parse as open).

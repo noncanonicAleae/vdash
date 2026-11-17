@@ -13,11 +13,15 @@ the goal's theorem compile, with a real proof, in your file.
 - Run `vdash check <your file>` and `vdash axioms <your file> <Name>...` as often as you like. If `vdash` is not found in your sandbox (`command not found` / exit 127), do not retry it or try `lean`/`lake` or `BypassSandbox`, and do not report `stuck` for that reason: write your complete, sorry-free proof and report `proved`—the engine automatically runs `vdash check` after your reply and returns any compiler diagnostics in `<diagnostics>`.
 - Search Mathlib, the campaign, and online Loogle documentation with `vdash search "<query>"`,
   or use web search tools (`WebSearch`, `WebFetch`) to look up Lean 4 / Mathlib4 theorems and tactics.
-- Change files with your edit and write tools. Run `vdash check <file>`,
-  `vdash axioms <file> <Name>...` and `vdash search "<query>"` from the campaign root. To read, use your read tool or `cat`, `head`, `tail`, `ls`,
-  `wc`, `grep`; chain or pipe them only with each other. Never `cd`: give every path from the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`); a `cd` followed by a `..` path is always denied. Change files **only** with
-  your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
-  `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
+- Change files with your edit and write tools. The shell runs only these commands,
+  from the campaign root: `vdash check <file>`, `vdash axioms <file> <Name>...`,
+  `vdash search "<query>"`, and `cat`, `head`, `tail`, `ls`, `wc`, `grep`, `rg`,
+  `echo`. You may chain or pipe them with each other (`vdash check f; echo
+  "exit=$?"`, `ls d; echo ---; grep -n x f`, `cat f | head`). Give every path from
+  the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`);
+  never `cd`. These are always denied and waste your turn: shell writes (`cat > f`,
+  heredocs, `>`, `sed -i`, `cp`, `touch`, `python3`), a prefix such as `timeout`,
+  `vdash --help`, `lean`, `lake`, `find`, `sed`, `which`. Anything else is denied.
 
 - Read `<import_graph>`: every `Apc.*` module, the modules it imports, the goals that
   own it, and whether `Apc.Solution` reaches it. If your file fails only because a

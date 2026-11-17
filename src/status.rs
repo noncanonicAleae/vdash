@@ -36,7 +36,8 @@ pub fn gather(ctx: &Ctx) -> Result<Summary> {
         engine_pid: events::engine_running(ctx),
         bulletin_tail: tail,
         amendments: list_dir(&ctx.campaign.amendments_dir()),
-        escalations: list_dir(&ctx.campaign.escalations_dir()),
+        // Open ones only, as `#N (round r, from X): summary` (M6-04).
+        escalations: crate::escalation::open(ctx).iter().map(|e| e.line()).collect(),
     })
 }
 
@@ -75,9 +76,13 @@ pub fn render_summary(s: &Summary) -> String {
         }
     }
     if !s.amendments.is_empty() || !s.escalations.is_empty() {
-        let _ = writeln!(o, "\namendments: {} · escalations: {}", s.amendments.len(), s.escalations.len());
-        for e in &s.escalations {
-            let _ = writeln!(o, "  ! {e}");
+        let _ = writeln!(o, "\namendments: {} · open escalations: {}", s.amendments.len(), s.escalations.len());
+        for e in s.escalations.iter().take(10) {
+            let short: String = e.chars().take(150).collect();
+            let _ = writeln!(o, "  ! {short}");
+        }
+        if s.escalations.len() > 10 {
+            let _ = writeln!(o, "  … {} more (`vdash escalations`)", s.escalations.len() - 10);
         }
     }
     if !st.usage.is_empty() {

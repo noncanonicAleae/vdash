@@ -169,6 +169,8 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         accept_weakening: bool,
     },
+    /// Close lead escalations; a non-empty answer also becomes guidance (M6-04).
+    ResolveEscalation { ns: Vec<u32>, answer: String },
 }
 
 fn inbox_dir(ctx: &Ctx) -> PathBuf {

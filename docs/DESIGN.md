@@ -322,6 +322,18 @@ exact-replace edit (`old_text` must occur once), not a diff.
    by the gate.
 6. `vdash amend list` is the end-of-campaign review: every amendment, its
    justification, verdict and approver.
+7. **Escalations from team leads** (questions only a human can decide: a statement
+   that looks false or too weak, whether to accept a cited result as a hypothesis)
+   are written to `escalations/` too. All escalations share one numbering (largest
+   existing number plus one), and each file carries `- status:`. The human answers
+   one with `vdash resolve N <answer>` / `/resolve N <answer>`, which closes it and
+   queues the answer as guidance for the orchestrator, or dismisses it with
+   `resolve N` (ranges such as `1-15` work); an amendment's escalation closes when the
+   amendment is applied or rejected. With an engine running, the decision goes
+   through the inbox, since the engine would revert a file edited mid-round.
+   Orchestrator and leads see only open escalations; a lead's escalation that repeats
+   an open one (Jaccard ≥ 0.6 on its words) is dropped with a note, and the lead skill
+   forbids escalating tooling or build problems, which the engine handles.
 
 ## 11. Processes: engine, app, events
 - **Engine**: the process that runs proof rounds (`vdash prove`). It holds
@@ -360,6 +372,8 @@ proof strategy") and is also appended to `STRATEGY.md`.
 | `/prove`, `/pause`, `/resume`, `/stop` | control the engine |
 | `/gate`, `/tcb` | run the gate; show what must be trusted |
 | `/amend [approve N \| reject N]` | list or decide amendments |
+| `/escalations [all \| N]` | open escalations; `all` adds closed ones, `N` shows one |
+| `/resolve <N[-M][,…]> [answer]` | close escalations; an answer also becomes guidance |
 | `/agents`, `/logs <agent>` | running agents; one agent's transcript |
 | `/bulletin`, `/cost` | shared notices; usage per role and backend |
 | `/doctor` | toolchain and login checks |

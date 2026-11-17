@@ -101,6 +101,22 @@ enum Commands {
         #[command(subcommand)]
         action: AmendAction,
     },
+    /// List open escalations (questions for you), or show one in full
+    Escalations {
+        /// Also list resolved and closed ones
+        #[arg(long)]
+        all: bool,
+        /// Show escalation N's file
+        n: Option<String>,
+    },
+    /// Close escalations, e.g. `vdash resolve 23 "use them as cited hypotheses"` or
+    /// `vdash resolve 1-15`. An answer is also queued as guidance for the orchestrator.
+    Resolve {
+        /// Numbers or ranges: 23, 16-22, 1-3,7
+        which: String,
+        /// Your answer (omit to dismiss)
+        answer: Vec<String>,
+    },
     /// Side question to the monitor agent
     Btw {
         question: String,
@@ -451,6 +467,23 @@ fn run(cli: Cli) -> Result<()> {
                 }
             };
             print!("{out}");
+            Ok(())
+        }
+        Some(Commands::Escalations { all, n }) => {
+            let (ctx, _) = build_ctx(cli.campaign_dir.as_deref())?;
+            let out = match n {
+                Some(n) => {
+                    let n: u32 = n.trim_start_matches('#').parse().map_err(|_| vdash::error::VdashError::new(2, format!("'{n}' is not an escalation number")))?;
+                    vdash::escalation::show(&ctx, n)?
+                }
+                None => vdash::escalation::list_text(&ctx, all),
+            };
+            print!("{out}");
+            Ok(())
+        }
+        Some(Commands::Resolve { which, answer }) => {
+            let (ctx, _) = build_ctx(cli.campaign_dir.as_deref())?;
+            print!("{}", vdash::escalation::resolve_cmd(&ctx, &which, &answer.join(" "))?);
             Ok(())
         }
         None => {

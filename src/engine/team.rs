@@ -528,6 +528,14 @@ pub fn run_worker_checked<'a>(
                 diag = Some("The engine checked your file and it compiled cleanly (OK). Do not mark stuck/partial due to missing vdash in the sandbox: if your proof is complete and matches the goal statement, reply with status \"proved\" and the theorem name(s) in lean_names.".into());
             }
             Err(report) => {
+                // The build already reran (M3-09). An error that is still about the
+                // build machinery is not the worker's to fix: say so on the bulletin
+                // and do not spend the worker's retries on it.
+                if lean::build::report_is_infra(&report) {
+                    let first = report.lines().find(|l| l.contains(": error: ") && lean::build::is_infra_text(l)).unwrap_or("").to_string();
+                    eng.bulletin(round, "engine", &format!("build infrastructure error while checking {file} (not sent to the worker; the engine re-checks it later): {first}"));
+                    break;
+                }
                 if attempt < WORKER_RETRIES {
                     events::emit(&eng.ctx, round, "note", json!({"text": format!("{file} does not check yet; sending the errors back to the worker")}));
                 }
@@ -547,16 +555,10 @@ fn trusted_unchanged(eng: &Engine) -> bool {
     })
 }
 
-pub fn write_escalation(ctx: &Ctx, round: u32, who: &str, text: &str) -> Result<()> {
-    let dir = ctx.campaign.escalations_dir();
-    fs::create_dir_all(&dir).map_err(|e| VdashError::io_path(&dir, e))?;
-    let n = fs::read_dir(&dir).map(|r| r.count()).unwrap_or(0) as u32 + 1;
-    let first: String = text.lines().next().unwrap_or("issue").chars().take(40).collect();
-    let p = dir.join(format!("{n:03}-{}.md", slug(&first).to_lowercase()));
-    let body = format!("# Escalation {n}\n\n- round: {round}\n- from: {who}\n- at: {}\n\n{}\n", util::now_iso(), text.trim());
-    fs::write(&p, body).map_err(|e| VdashError::io_path(&p, e))?;
-    events::emit(ctx, round, "escalation", json!({"n": n, "text": first}));
-    Ok(())
+/// Open escalations, one `#N (round r, from X): summary` per line (M6-04). Resolved
+/// ones are left out, so agents stop working around questions already answered.
+pub fn open_escalations_text(ctx: &Ctx) -> String {
+    crate::escalation::open(ctx).iter().map(|e| e.line()).collect::<Vec<_>>().join("\n")
 }
 
 // ------------------------------------------------------------------ plan
@@ -671,9 +673,7 @@ pub fn orchestrate(eng: &mut Engine, round: u32) -> Result<()> {
     let mut slow: Vec<(&String, &f64)> = st.module_times.iter().collect();
     slow.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
     let slow: String = slow.iter().take(5).map(|(m, t)| format!("{m}: {t:.1}s")).collect::<Vec<_>>().join("\n");
-    let escalations: String = fs::read_dir(eng.ctx.campaign.escalations_dir())
-        .map(|r| r.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_default();
+    let escalations = open_escalations_text(&eng.ctx);
     let max_leads = eng.ctx.cfg.budget.max_leads;
     let req = Request::new(
         Role::Orchestrator,
@@ -979,6 +979,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
     .section("plan", serde_json::to_string_pretty(&lp).unwrap_or_default())
     .section("falsifiers", serde_json::to_string_pretty(&fals).unwrap_or_default())
     .section("workers", serde_json::to_string_pretty(&compact).unwrap_or_default())
+    .section("open_escalations", open_escalations_text(ctx))
     .label(id);
     let (_, out) = agents::run(ctx, eng.pool, round, req)?;
     let summ = out.ok().cloned().unwrap_or_else(|| {
@@ -1028,7 +1029,12 @@ pub fn verify(eng: &mut Engine, round: u32) -> Result<()> {
         }
         if !l["escalations_written"].as_bool().unwrap_or(false) {
             for e in l["escalations"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
-                write_escalation(&eng.ctx, round, lid, e)?;
+                // A duplicate of an open escalation is skipped with a note (M6-05).
+                if let Ok(n) = crate::escalation::write_lead(&eng.ctx, round, lid, e)? {
+                    if let Some(rel) = crate::escalation::rel_of(&eng.ctx, n) {
+                        eng.own(&rel);
+                    }
+                }
             }
             set_rd(eng, &["leads", lid, "escalations_written"], json!(true))?;
         }
@@ -1161,12 +1167,16 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
     if work.is_empty() {
         return Ok(());
     }
-    let before_ok = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&["Apc.Solution".to_string()]))
-        .map(|r| {
-            record_module_times(&eng.ctx, &r);
-            r.ok
-        })
-        .unwrap_or(false);
+    // The integrator starts from the engine's own check of the solution (M8-07), so
+    // it does not spend its first turn trying to run one.
+    let (before_ok, solution_check) =
+        match lean::build::check_file_report(&eng.ctx, std::path::Path::new("lean/Apc/Solution.lean"), &eng.ctx.campaign.root) {
+            Ok((report, ok, r)) => {
+                record_module_times(&eng.ctx, &r);
+                (ok, report)
+            }
+            Err(e) => (false, e.message),
+        };
     let st = eng.state()?;
     let snap = policy::snapshot(&eng.ctx);
     let mut slow: Vec<(&String, &f64)> = st.module_times.iter().filter(|(m, _)| m.starts_with("Apc.Proof")).collect();
@@ -1174,6 +1184,7 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
     let req = Request::new(Role::Integrator, Reply::Integrator, "Move the verified lemmas below into lean/Apc/Proof/Lib/, remove duplicates, and keep every file building.")
         .section("verified_lemmas", work.iter().map(|g| format!("{} in {}: {}", g.lean_name, g.file, g.statement)).collect::<Vec<_>>().join("\n"))
         .section("slow_modules", slow.iter().take(5).map(|(m, t)| format!("{m}: {t:.1}s")).collect::<Vec<_>>().join("\n"))
+        .section("solution_check", format!("`vdash check lean/Apc/Solution.lean`, run by the engine just now:\n{solution_check}"))
         .label("integrate");
     let (_, out) = agents::run(&eng.ctx, eng.pool, round, req)?;
     let allowed: BTreeSet<String> =
@@ -1343,7 +1354,7 @@ mod tests {
             "Apc.Proof.Work.Temp".to_string(),
             ModuleResult { module: "Apc.Proof.Work.Temp".into(), ok: true, cached: false, seconds: 2.3, diagnostics: vec![] },
         );
-        record_module_times(&ctx, &BuildReport { results, ok: true });
+        record_module_times(&ctx, &BuildReport { results, ok: true, retries: 0 });
 
         let st1 = util::load_state(&ctx.campaign).unwrap();
         assert_eq!(st1.module_times.get("Apc.Proof.Lib.Slow"), Some(&12.5));
@@ -1356,7 +1367,7 @@ mod tests {
             "Apc.Proof.Lib.Slow".to_string(),
             ModuleResult { module: "Apc.Proof.Lib.Slow".into(), ok: true, cached: true, seconds: 0.0, diagnostics: vec![] },
         );
-        record_module_times(&ctx, &BuildReport { results: cached_res, ok: true });
+        record_module_times(&ctx, &BuildReport { results: cached_res, ok: true, retries: 0 });
 
         let st2 = util::load_state(&ctx.campaign).unwrap();
         assert_eq!(st2.module_times.get("Apc.Proof.Lib.Slow"), Some(&12.5));

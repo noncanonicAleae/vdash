@@ -412,3 +412,37 @@ fn stale_proved_goals_reopen_and_orphans_become_repair_goals() {
     // With the orphan repaired, the gate gets past the build to the per-target checks.
     assert!(st.targets.values().all(|t| !t.reasons.iter().any(|r| r == "build_failed")), "{:?}", st.targets);
 }
+
+/// M6-04: with an engine running, `/resolve` goes through the inbox; `checkpoint`
+/// closes the file, queues the answer as guidance, and the orchestrator's list of
+/// escalations drops it.
+#[test]
+fn resolve_escalation_through_the_engine_inbox() {
+    require_lean!();
+    let tmp = TempDir::new().unwrap();
+    let ctx = approved_isort(&tmp);
+    vdash::util::update_state(&ctx.campaign, |s| s.round = 3).unwrap();
+    vdash::escalation::write_lead(&ctx, 2, "L1", "Should the sortedness lemma carry the cited hypothesis?").unwrap().unwrap();
+    vdash::escalation::write_lead(&ctx, 2, "L2", "Is isortBad meant to fail on duplicates as well?").unwrap().unwrap();
+
+    let fb = Arc::new(FakeBackend::new(BackendKind::Claude));
+    let pool = Pool::new(&ctx, vec![fb]);
+    let mut eng = engine::Engine::new(ctx.clone(), &pool, Opts::default(), Arc::new(AtomicBool::new(false)));
+    vdash::events::send(&ctx, &vdash::events::Control::ResolveEscalation { ns: vec![1], answer: "Yes, cite it.".into() }).unwrap();
+    assert!(matches!(eng.checkpoint(3).unwrap(), engine::Flow::Continue));
+
+    let es = vdash::escalation::list(&ctx);
+    assert_eq!(es.iter().map(|e| (e.n, e.status.as_str())).collect::<Vec<_>>(), vec![(1, "resolved"), (2, "open")]);
+    let st = vdash::util::load_state(&ctx.campaign).unwrap();
+    assert_eq!(st.pending_guidance.len(), 1);
+    assert!(st.pending_guidance[0].starts_with("Answer to escalation #1 (L1, round 2: Should the sortedness"), "{:?}", st.pending_guidance);
+    assert!(fs::read_to_string(ctx.campaign.strategy_file()).unwrap().contains("Yes, cite it."));
+    let open = engine::team::open_escalations_text(&ctx);
+    assert!(!open.contains("#1 ") && open.contains("#2 (round 2, from L2): Is isortBad"), "{open}");
+
+    // An amendment-backed or unknown number is refused with a note, not a crash.
+    vdash::events::send(&ctx, &vdash::events::Control::ResolveEscalation { ns: vec![9], answer: String::new() }).unwrap();
+    assert!(matches!(eng.checkpoint(3).unwrap(), engine::Flow::Continue));
+    let evs = vdash::events::tail(&ctx.campaign.events_file(), 10).0;
+    assert!(evs.iter().any(|e| e.kind == "note" && e.str("text").contains("there is no escalation #9")));
+}

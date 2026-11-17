@@ -278,7 +278,16 @@ impl App {
                 Some(line(Kind::Good, &b, "back from its usage limit".to_string()))
             }
             "amendment" => Some(line(Kind::Warn, "amend", format!("amendment {} is {}", e.u64("n").unwrap_or(0), e.str("status")))),
-            "escalation" => Some(line(Kind::Bad, "escalation", format!("#{} needs you: {}", e.u64("n").unwrap_or(0), e.str("text")))),
+            "escalation" => {
+                let from = e.str("from");
+                let from = if from.is_empty() { String::new() } else { format!(" ({from})") };
+                Some(line(Kind::Bad, "escalation", format!("#{}{from} needs you: {} · /resolve {} [answer]", e.u64("n").unwrap_or(0), e.str("text"), e.u64("n").unwrap_or(0))))
+            }
+            "escalation_resolved" => Some(line(
+                Kind::Good,
+                "escalation",
+                format!("#{} {}", e.u64("n").unwrap_or(0), if e.data.get("answered").and_then(serde_json::Value::as_bool).unwrap_or(false) { "answered; the answer goes to the orchestrator" } else { "dismissed" }),
+            )),
             "paused" => {
                 self.paused = true;
                 None

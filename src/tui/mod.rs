@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{event::DisableBracketedPaste, event::EnableBracketedPaste, execute};
+use crossterm::{event::DisableBracketedPaste, event::DisableMouseCapture, event::EnableBracketedPaste, event::EnableMouseCapture, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -801,6 +801,25 @@ impl Session {
                 self.busy("amend");
                 self.runner.vdash("amend", "amend", vec!["amend".into(), "approve".into(), n.to_string(), "--accept-weakening".into()]);
             }
+            Cmd::Escalations { all, show } => {
+                self.busy("escalations");
+                let mut args = vec!["escalations".to_string()];
+                if all {
+                    args.push("--all".into());
+                }
+                if let Some(n) = show {
+                    args.push(n.to_string());
+                }
+                self.runner.vdash("escalations", "escalations", args);
+            }
+            Cmd::Resolve { which, answer } => {
+                self.busy("resolve");
+                let mut args = vec!["resolve".to_string(), which];
+                if !answer.is_empty() {
+                    args.push(answer);
+                }
+                self.runner.vdash("resolve", "resolve", args);
+            }
             Cmd::AmendPropose(f) => {
                 self.busy("amend");
                 self.runner.vdash("amend", "amend", vec!["amend".into(), "propose".into(), f]);
@@ -885,7 +904,7 @@ struct TermGuard;
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
     }
 }
 
@@ -910,11 +929,11 @@ pub fn run(ctx: Ctx) -> Result<()> {
 
     enable_raw_mode().map_err(|e| VdashError::new(5, format!("terminal: {e}")))?;
     let _guard = TermGuard;
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste).map_err(|e| VdashError::new(5, format!("terminal: {e}")))?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture).map_err(|e| VdashError::new(5, format!("terminal: {e}")))?;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
         prev(info);
     }));
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|e| VdashError::new(5, format!("terminal: {e}")))?;
@@ -927,9 +946,9 @@ pub fn run(ctx: Ctx) -> Result<()> {
         }
         if let Some(backend) = s.pending_login.take() {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
+            let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
             let res = login_interactive(Some(&s.ctx.cfg), &backend);
-            let _ = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste);
+            let _ = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture);
             let _ = enable_raw_mode();
             let _ = term.clear();
             match res {

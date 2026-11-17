@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,7 +40,47 @@ pub struct ModuleResult {
 pub struct BuildReport {
     pub results: BTreeMap<String, ModuleResult>,
     pub ok: bool,
+    /// Reruns after an infrastructure error (M3-09).
+    #[serde(default)]
+    pub retries: u32,
 }
+
+/// An error caused by the build machinery rather than by the Lean source (M3-09): a
+/// dependency's olean vanished or is unreadable, or Lean was killed by a signal.
+pub fn is_infra_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    (t.contains("object file") && t.contains("does not exist"))
+        || (t.contains(".olean") && (t.contains("failed to read file") || t.contains("invalid header") || t.contains("incompatible header")))
+        || t.starts_with("lean exited with status none")
+}
+
+/// Does module result `r` fail with infrastructure errors only?
+pub fn infra_failure(r: &ModuleResult) -> bool {
+    if r.ok {
+        return false;
+    }
+    let errs: Vec<&Diagnostic> = r.diagnostics.iter().filter(|d| d.severity == "error").collect();
+    !errs.is_empty() && errs.iter().all(|d| is_infra_text(&d.text))
+}
+
+/// Is a `vdash check` report failing only because of infrastructure errors? Lines
+/// `dependency M failed` follow from another error and are neutral.
+pub fn report_is_infra(report: &str) -> bool {
+    let errs: Vec<&str> = report.lines().filter(|l| l.contains(": error: ")).collect();
+    let mut any = false;
+    for l in errs {
+        let text = l.split_once(": error: ").map(|x| x.1).unwrap_or(l);
+        if is_infra_text(text) {
+            any = true;
+        } else if !(text.starts_with("dependency ") && text.ends_with(" failed")) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Reruns of a build that hit an infrastructure error.
+pub const INFRA_RETRIES: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,8 +121,57 @@ fn olean_diag_path(olean: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn remove_olean_artifacts(olean: &Path) {
-    let _ = fs::remove_file(olean);
+fn olean_lock_path(olean: &Path) -> PathBuf {
+    let mut os = olean.as_os_str().to_os_string();
+    os.push(".lock");
+    PathBuf::from(os)
+}
+
+/// A fresh output path next to `olean`, unique to this process and call.
+fn olean_tmp_path(olean: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut os = olean.as_os_str().to_os_string();
+    os.push(format!(".{}-{n}.tmp", std::process::id()));
+    PathBuf::from(os)
+}
+
+/// Exclusive lock on one module's cache entry, held across the cache check and the
+/// compile. Several builds share one build directory (parallel workers' checks, in
+/// one process or several); without it they compiled the same module at once and
+/// deleted each other's oleans while a dependent was reading them.
+struct ModuleLock {
+    file: fs::File,
+}
+
+impl Drop for ModuleLock {
+    fn drop(&mut self) {
+        let _ = flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
+fn lock_module(olean: &Path) -> Result<ModuleLock> {
+    if let Some(parent) = olean.parent() {
+        fs::create_dir_all(parent).map_err(|e| VdashError::io_path(parent, e))?;
+    }
+    let lock_path = olean_lock_path(olean);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| VdashError::io_path(&lock_path, e))?;
+    flock(&file, FlockOperation::LockExclusive)
+        .map_err(|e| VdashError::new(5, format!("cannot lock {}: {e}", lock_path.display())))?;
+    Ok(ModuleLock { file })
+}
+
+/// Mark a module's cache entry invalid without deleting its olean. Another build
+/// may be compiling a dependent against that olean right now (it saw the module
+/// succeed); deleting it made that compile fail with "object file … does not
+/// exist". A keyless olean is never a cache hit, and no build compiles against a
+/// module that failed in the same build, so the stale file is never used.
+fn invalidate_cache_entry(olean: &Path) {
     let _ = fs::remove_file(olean_key_path(olean));
     let _ = fs::remove_file(olean_diag_path(olean));
 }
@@ -238,6 +329,9 @@ fn compile_single_module(
     let diag_path = olean_diag_path(&olean_path);
     let default_rel = format!("lean/{}.lean", module_rel_stem(module).display());
 
+    // Held until return. Lock order is module lock, then slot; a slot holder never
+    // waits for a module lock, so the two cannot deadlock.
+    let _lock = lock_module(&olean_path)?;
     if olean_path.is_file() && key_path.is_file() {
         if let Ok(stored_key) = fs::read_to_string(&key_path) {
             if stored_key.trim() == key {
@@ -260,27 +354,34 @@ fn compile_single_module(
     }
 
     let _slot = slots::acquire(ctx)?;
-    if let Some(parent) = olean_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| VdashError::io_path(parent, e))?;
-    }
-    remove_olean_artifacts(&olean_path);
 
+    // Compile to a private path and rename into place, so a concurrent reader
+    // sees either the old olean or the complete new one, never a gap.
+    let tmp_path = olean_tmp_path(&olean_path);
     let mut cmd = lean::command(ctx, "lean")?;
     cmd.env("LEAN_PATH", lp)
         .arg("--json")
         .arg("-R")
         .arg(tree)
         .arg("-o")
-        .arg(&olean_path)
+        .arg(&tmp_path)
         .arg(&src_path);
 
     let timeout_s = ctx.cfg.budget.lean_timeout_s;
     let start = Instant::now();
-    let out = proc::run(&mut cmd, None, Duration::from_secs(timeout_s))?;
+    let run = proc::run(&mut cmd, None, Duration::from_secs(timeout_s));
     let seconds = start.elapsed().as_secs_f64();
+    let out = match run {
+        Ok(out) => out,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
 
     if out.timed_out {
-        remove_olean_artifacts(&olean_path);
+        let _ = fs::remove_file(&tmp_path);
+        invalidate_cache_entry(&olean_path);
         return Ok(ModuleResult {
             module: module.to_string(),
             ok: false,
@@ -306,17 +407,25 @@ fn compile_single_module(
         &default_rel,
     );
     let has_error = diags.iter().any(|d| d.severity == "error");
-    let ok = out.status == Some(0) && !has_error && olean_path.is_file();
+    let ok = out.status == Some(0) && !has_error && tmp_path.is_file();
 
     if ok {
-        fs::write(&key_path, format!("{key}\n")).map_err(|e| VdashError::io_path(&key_path, e))?;
+        // Drop the old key first: a crash between the rename and the key write
+        // leaves a keyless olean, which is rebuilt next time.
+        invalidate_cache_entry(&olean_path);
+        if let Err(e) = fs::rename(&tmp_path, &olean_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(VdashError::io_path(&olean_path, e));
+        }
         let cd = CachedDiags {
             version: 1,
             diagnostics: diags.clone(),
         };
         jsonio::write_atomic(&diag_path, &cd)?;
+        fs::write(&key_path, format!("{key}\n")).map_err(|e| VdashError::io_path(&key_path, e))?;
     } else {
-        remove_olean_artifacts(&olean_path);
+        let _ = fs::remove_file(&tmp_path);
+        invalidate_cache_entry(&olean_path);
     }
 
     Ok(ModuleResult {
@@ -370,7 +479,27 @@ fn scope_graph_for_targets(
     }
 }
 
+/// Build `targets` (or everything) in `tree` into `build_dir`. A build where some
+/// module failed with an infrastructure error only is rerun, up to
+/// [`INFRA_RETRIES`] times; cached modules stay cached, so a rerun rebuilds only
+/// what is missing (M3-09).
 pub fn build(
+    ctx: &Ctx,
+    tree: &Path,
+    build_dir: &Path,
+    targets: Option<&[String]>,
+) -> Result<BuildReport> {
+    let mut rep = build_once(ctx, tree, build_dir, targets)?;
+    while rep.retries < INFRA_RETRIES && rep.results.values().any(infra_failure) {
+        let retries = rep.retries + 1;
+        std::thread::sleep(Duration::from_millis(300));
+        rep = build_once(ctx, tree, build_dir, targets)?;
+        rep.retries = retries;
+    }
+    Ok(rep)
+}
+
+fn build_once(
     ctx: &Ctx,
     tree: &Path,
     build_dir: &Path,
@@ -402,7 +531,10 @@ pub fn build(
                     .cloned()
                     .unwrap_or_else(|| fd.clone());
                 let olean_path = module_olean_path(build_dir, &m);
-                remove_olean_artifacts(&olean_path);
+                {
+                    let _lock = lock_module(&olean_path)?;
+                    invalidate_cache_entry(&olean_path);
+                }
                 let default_rel = format!("lean/{}.lean", module_rel_stem(&m).display());
                 root_failure.insert(m.clone(), root_failed.clone());
                 results.insert(
@@ -461,7 +593,7 @@ pub fn build(
     }
 
     let ok = results.values().all(|r| r.ok);
-    Ok(BuildReport { results, ok })
+    Ok(BuildReport { results, ok, retries: 0 })
 }
 
 pub fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -578,6 +710,33 @@ pub fn check_file_report(ctx: &Ctx, file_arg: &Path, cwd: &Path) -> Result<(Stri
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn diag(sev: &str, text: &str) -> Diagnostic {
+        Diagnostic { file: "lean/Apc/X.lean".into(), line: 1, col: 0, severity: sev.into(), kind: String::new(), text: text.into() }
+    }
+
+    #[test]
+    fn infra_classifier() {
+        let missing = "object file '/c/.build/work/Apc/Proof/Lib/QSpec.olean' of module Apc.Proof.Lib.QSpec does not exist";
+        assert!(is_infra_text(missing));
+        assert!(is_infra_text("failed to read file '/c/.build/work/Apc/A.olean', invalid header"));
+        assert!(is_infra_text("lean exited with status None"));
+        assert!(!is_infra_text("unknown identifier 'foo'"));
+        assert!(!is_infra_text("No goals to be solved"));
+        let r = |ok, d: Vec<Diagnostic>| ModuleResult { module: "Apc.X".into(), ok, cached: false, seconds: 0.0, diagnostics: d };
+        assert!(infra_failure(&r(false, vec![diag("error", missing), diag("warning", "declaration uses 'sorry'")])));
+        assert!(!infra_failure(&r(false, vec![diag("error", missing), diag("error", "type mismatch")])));
+        assert!(!infra_failure(&r(true, vec![])));
+        assert!(!infra_failure(&r(false, vec![])));
+        // The report the quartic workers got (round 6).
+        let report = format!(
+            "lean/Apc/Proof/Work/AndOr.lean:1:1: error: dependency Apc.Proof.Work.Separation failed\nlean/Apc/Proof/Work/Separation.lean:1:0: error: {missing}\nFAILED (2 errors)\n"
+        );
+        assert!(report_is_infra(&report));
+        assert!(!report_is_infra("lean/Apc/X.lean:99:4: error: No goals to be solved\nFAILED (1 errors)\n"));
+        assert!(!report_is_infra(&format!("{report}lean/Apc/Y.lean:3:1: error: unknown constant\n")));
+        assert!(!report_is_infra("OK\n"));
+    }
 
     #[test]
     fn scope_graph_ignores_missing_imports_outside_target_closure() {

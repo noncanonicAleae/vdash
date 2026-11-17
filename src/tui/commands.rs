@@ -33,6 +33,10 @@ pub enum Cmd {
     /// `/amend approve N --accept-weakening`: apply an escalated proposal.
     AmendAcceptWeakening(u32),
     AmendPropose(String),
+    /// `/escalations [all]` lists; `/escalations N` shows one file.
+    Escalations { all: bool, show: Option<u32> },
+    /// `/resolve <N[-M][,…]> [answer]`.
+    Resolve { which: String, answer: String },
     Agents,
     Logs(String),
     Bulletin,
@@ -63,6 +67,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("gate", "", "run the gatekeeper now"),
     ("tcb", "", "show what a reader must trust"),
     ("amend", "[approve N [--accept-weakening] | reject N | propose <file>]", "list, decide or propose spec amendments"),
+    ("escalations", "[all | N]", "open escalations (all: also closed ones; N: one in full)"),
+    ("resolve", "<N[-M][,…]> [answer]", "close escalations; an answer also becomes guidance"),
     ("agents", "", "agents running now"),
     ("logs", "<agent>", "one agent's transcript, e.g. /logs worker-3"),
     ("bulletin", "", "recent shared notices"),
@@ -252,6 +258,25 @@ pub fn parse(line: &str) -> Result<Input, String> {
                 .map_err(|_| usage("amend")),
             _ => Err(usage("amend")),
         },
+        "escalations" | "escalation" | "esc" => match words.as_slice() {
+            [] => Ok(Cmd::Escalations { all: false, show: None }),
+            ["all"] | ["--all"] => Ok(Cmd::Escalations { all: true, show: None }),
+            [n] => n.trim_start_matches('#').parse::<u32>().map(|n| Cmd::Escalations { all: false, show: Some(n) }).map_err(|_| usage("escalations")),
+            _ => Err(usage("escalations")),
+        },
+        "resolve" | "dismiss" => match words.as_slice() {
+            [] => Err(usage("resolve")),
+            [which, ..] => {
+                if crate::escalation::parse_numbers(which).is_err() {
+                    return Err(usage("resolve"));
+                }
+                let answer = args[which.len()..].trim().to_string();
+                if name == "dismiss" && !answer.is_empty() {
+                    return Err("/dismiss takes no answer; use /resolve N <answer>".to_string());
+                }
+                Ok(Cmd::Resolve { which: which.to_string(), answer })
+            }
+        },
         "agents" => none(Cmd::Agents),
         "logs" | "log" => match words.as_slice() {
             [a] => Ok(Cmd::Logs(a.to_string())),
@@ -375,6 +400,18 @@ mod tests {
         assert_eq!(parse("/search").unwrap_err(), "usage: /search <query>");
         assert_eq!(parse("/amend approve x").unwrap_err(), "usage: /amend [approve N [--accept-weakening] | reject N | propose <file>]");
         assert_eq!(parse("/amend propose p.json").unwrap(), Input::Cmd(Cmd::AmendPropose("p.json".into())));
+        assert_eq!(parse("/escalations").unwrap(), Input::Cmd(Cmd::Escalations { all: false, show: None }));
+        assert_eq!(parse("/escalations all").unwrap(), Input::Cmd(Cmd::Escalations { all: true, show: None }));
+        assert_eq!(parse("/esc #23").unwrap(), Input::Cmd(Cmd::Escalations { all: false, show: Some(23) }));
+        assert_eq!(
+            parse("/resolve 23 you can use both lemmas as cited hypotheses").unwrap(),
+            Input::Cmd(Cmd::Resolve { which: "23".into(), answer: "you can use both lemmas as cited hypotheses".into() })
+        );
+        assert_eq!(parse("/resolve 1-15,19").unwrap(), Input::Cmd(Cmd::Resolve { which: "1-15,19".into(), answer: String::new() }));
+        assert_eq!(parse("/dismiss 4").unwrap(), Input::Cmd(Cmd::Resolve { which: "4".into(), answer: String::new() }));
+        assert!(parse("/resolve").is_err());
+        assert!(parse("/resolve abc").is_err());
+        assert!(parse("/dismiss 4 because").is_err());
         assert_eq!(parse("/gaet").unwrap_err(), "unknown command /gaet. Did you mean /gate?");
         assert!(parse("/zzzzzz").unwrap_err().contains("/help"));
         assert_eq!(parse("/status now").unwrap_err(), "usage: /status");

@@ -13,6 +13,7 @@ use crate::backend::pool::Pool;
 use crate::backend::Profile;
 use crate::config::{AmendmentPolicy, Role};
 use crate::error::{VdashError, Result};
+use crate::escalation;
 use crate::events::{self, Control};
 use crate::fingerprint;
 use crate::lean;
@@ -67,6 +68,10 @@ pub struct AmendmentRecord {
     /// the spec was knowingly weakened to match the code (DESIGN §10).
     #[serde(default)]
     pub weakening_accepted: bool,
+    /// The escalation file written when the critic escalated this proposal
+    /// (escalations have their own numbering, M6-04).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub escalation: String,
 }
 
 /// A human's decision on an amendment, from the CLI, the app or the engine inbox.
@@ -83,8 +88,13 @@ impl AmendmentRecord {
         format!("amendments/{:03}-{}.md", self.n, self.slug)
     }
 
+    /// The escalation file; records from before M6-04 used the amendment number.
     pub fn escalation_rel_path(&self) -> String {
-        format!("escalations/{:03}-{}.md", self.n, self.slug)
+        if self.escalation.is_empty() {
+            format!("escalations/{:03}-{}.md", self.n, self.slug)
+        } else {
+            self.escalation.clone()
+        }
     }
 
     pub fn to_markdown(&self) -> String {
@@ -201,24 +211,19 @@ fn save_record(ctx: &Ctx, rec: &AmendmentRecord) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn save_escalation(ctx: &Ctx, rec: &AmendmentRecord) -> Result<PathBuf> {
-    let dir = ctx.campaign.escalations_dir();
-    fs::create_dir_all(&dir).map_err(|e| VdashError::io_path(&dir, e))?;
-    let path = ctx.campaign.root.join(rec.escalation_rel_path());
-    let mut md = String::new();
-    md.push_str(&format!("# Escalation {:03}: {}\n\n", rec.n, rec.slug));
-    md.push_str(&format!("- **Amendment**: `{}`\n", rec.rel_path()));
-    md.push_str(&format!("- **Target file**: `{}`\n", rec.file));
-    md.push_str(&format!("- **Critic reason**: {}\n\n", rec.critic_reason));
-    md.push_str("## Justification\n\n");
-    md.push_str(rec.justification.trim());
-    md.push_str("\n\n## Proposed Edit\n\n### Old Text\n```lean\n");
-    md.push_str(rec.old_text.trim_end());
-    md.push_str("\n```\n\n### New Text\n```lean\n");
-    md.push_str(rec.new_text.trim_end());
-    md.push_str("\n```\n");
-    fs::write(&path, md).map_err(|e| VdashError::io_path(&path, e))?;
-    Ok(path)
+/// Write the escalation file for an escalated proposal; returns its number.
+fn save_escalation(ctx: &Ctx, rec: &mut AmendmentRecord) -> Result<u32> {
+    let mut body = String::new();
+    body.push_str("## Justification\n\n");
+    body.push_str(rec.justification.trim());
+    body.push_str("\n\n## Proposed Edit\n\n### Old Text\n```lean\n");
+    body.push_str(rec.old_text.trim_end());
+    body.push_str("\n```\n\n### New Text\n```lean\n");
+    body.push_str(rec.new_text.trim_end());
+    body.push_str("\n```\n");
+    let (n, rel) = escalation::write_amendment(ctx, &rec.rel_path(), &rec.slug, &rec.file, &rec.critic_reason, &body)?;
+    rec.escalation = rel;
+    Ok(n)
 }
 
 fn next_amendment_number(ctx: &Ctx) -> Result<u32> {
@@ -321,6 +326,7 @@ pub fn propose(
         closer_to_code: false,
         critic_reason: String::new(),
         weakening_accepted: false,
+        escalation: String::new(),
     };
 
     // Early rejections without calling the critic:
@@ -459,15 +465,15 @@ pub fn propose(
     match rec.critic_verdict.as_str() {
         "escalate" => {
             rec.status = "escalated".to_string();
+            let en = save_escalation(ctx, &mut rec)?;
             save_record(ctx, &rec)?;
-            save_escalation(ctx, &rec)?;
             events::emit(
                 ctx,
                 round,
                 "amendment",
                 json!({ "n": n, "status": rec.status }),
             );
-            events::emit(ctx, round, "escalation", json!({ "n": n }));
+            events::emit(ctx, round, "escalation", json!({ "n": en, "text": format!("amendment {n:03} weakens the guarantee: {}", rec.critic_reason), "from": "critic" }));
             Ok((rec, false))
         }
         "accept" => {
@@ -645,6 +651,9 @@ pub fn apply(ctx: &Ctx, n: u32, approved_by: &str, accept_weakening: bool) -> Re
     rec.status = "applied".to_string();
     rec.approved_by = approved_by.to_string();
     save_record(ctx, &rec)?;
+    if rec.weakening_accepted {
+        escalation::close_for_amendment(ctx, &rec.escalation_rel_path(), "applied", approved_by)?;
+    }
 
     let rel_record = rec.rel_path();
     anchor::extend(ctx, n, &rel_record, approved_by)?;
@@ -722,9 +731,13 @@ pub fn process(
                 applied.push(n);
             }
         } else {
+            let was_escalated = rec.status == "escalated";
             rec.status = "rejected".to_string();
             rec.approved_by = "user".to_string();
             save_record(ctx, &rec)?;
+            if was_escalated {
+                escalation::close_for_amendment(ctx, &rec.escalation_rel_path(), "rejected", "user")?;
+            }
             events::emit(
                 ctx,
                 round,
@@ -804,9 +817,13 @@ pub fn reject_cmd(ctx: &Ctx, n: u32) -> Result<String> {
             n
         ))
     } else {
+        let was_escalated = rec.status == "escalated";
         rec.status = "rejected".to_string();
         rec.approved_by = "user".to_string();
         save_record(ctx, &rec)?;
+        if was_escalated {
+            escalation::close_for_amendment(ctx, &rec.escalation_rel_path(), "rejected", "user")?;
+        }
         let round = util::load_state(&ctx.campaign)
             .map(|s| s.round)
             .unwrap_or(0);

@@ -15,8 +15,11 @@ use crate::proc;
 /// burning turns on denied `cd …; cat …` (fact C13). `sed` and `find` are left out:
 /// `sed -n 'w f'` and `find -delete` write through an allow rule. Redirections and
 /// heredocs stay denied even with `Bash(cat *)` (C13).
-const SEARCH_RULES: [&str; 10] = [
+/// `echo` lets `vdash check f; echo "exit=$?"` and `ls d; echo ---; cat f` run, the
+/// commonest denial in a live campaign; `echo x > f` and `echo $(…)` stay denied (C15).
+const SEARCH_RULES: [&str; 11] = [
     "Bash(vdash search *)",
+    "Bash(echo *)",
     "Bash(grep *)",
     "Bash(rg *)",
     "Bash(cat *)",
@@ -237,6 +240,7 @@ mod tests {
         call.profile = Profile::Readonly;
         let a = ClaudeCli::args(&call);
         assert!(a.contains(&"Bash(vdash search *)".to_string()) && a.contains(&"Bash(cat *)".to_string()));
+        assert!(a.contains(&"Bash(echo *)".to_string()));
         assert!(!a.iter().any(|r| r.starts_with("Bash(sed") || r.starts_with("Bash(find")));
         assert!(!a.contains(&"Bash(vdash check *)".to_string()) && !a.contains(&"Edit".to_string()));
     }

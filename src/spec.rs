@@ -662,6 +662,15 @@ fn take_controls(ctx: &mut Ctx, pool: &Pool, round: u32, inbox: &mut Inbox) {
                     events::emit(ctx, round, "note", json!({"text": text}));
                 }
                 events::Control::AmendDecision { .. } => {}
+                // Escalations come from the proof phase; close the files, and keep a
+                // proof-phase answer out of the spec writer's guidance.
+                events::Control::ResolveEscalation { ns, answer } => {
+                    let text = match crate::escalation::resolve(ctx, round, &ns, &answer, "user") {
+                        Ok(r) => format!("escalation(s) {:?} closed", r.closed),
+                        Err(e) => format!("could not resolve escalation: {}", e.message),
+                    };
+                    events::emit(ctx, round, "note", json!({"text": text}));
+                }
             }
         }
         if !paused || inbox.stop {

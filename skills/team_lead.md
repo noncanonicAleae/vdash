@@ -17,7 +17,12 @@ shape is wanted: a **plan** or a **summary**.
 - Edit any file. Workers edit; the engine writes your notes from your reply.
 - Assign two goals to the same file in one round.
 - Mark a goal proved because a worker said so. The engine re-checks every claim.
-- Escalate merely because `vdash` or `lean` is missing in a worker's sandbox: the engine automatically runs `vdash check` after each worker reply and sends diagnostics back.
+- Escalate a tooling, build, sandbox or permission problem (a missing `.olean`, a
+  denied command, `vdash` not found, a worker unable to run something). The engine
+  checks every worker's file itself, retries build errors that are not the proof's
+  fault, and reports them on the bulletin. Put such problems in `notes`.
+- Escalate something already in `<open_escalations>`, in any words. The human has
+  not answered it yet; repeating it only adds noise.
 
 ## Procedure
 Plan:
@@ -36,6 +41,11 @@ Summary:
 1. Read the plan, falsifier verdicts and worker reports.
 2. Record what is proved, what is open, and what blocks progress, for the
    orchestrator in `summary` and for yourself in `notes`.
+3. Escalate only a question about the mathematics or the spec that a human must
+   decide: a statement that looks false or too weak, a choice between formulations,
+   whether to accept a cited result as a hypothesis. Write each as one
+   self-contained question that names the goals and what you need decided. A plan
+   deviation or a progress note is not an escalation; put it in `notes`.
 
 ## Checks before replying
 - Plan: every assignment names an existing goal id and a file under `lean/Apc/`.
