@@ -954,7 +954,10 @@ agent and between stages), acts, and moves each to `inbox/done/`.
        `spillover`, every other available backend (after the listed ones).
     2. Pick the first candidate that is not paused and has a free slot, preferring
        the one with the most free slots; if none, wait on a condition variable for a
-       slot or for the earliest `paused_until`.
+       slot or for the earliest `paused_until`. A spillover backend is a candidate
+       only while every listed backend is paused or unavailable: a listed backend
+       that is merely busy is waited for (fixed 2026-11-18; spillover used to win on
+       free slots, so Gemini served roles set to Claude only).
     3. Run. `Quota` → pause that backend for `60·2^step` s (each pause capped at
        1800 s), emit `backend_paused`, and go back to 1 for this call. Success on a
        backend resets its step and emits `backend_resumed` if it had been paused.

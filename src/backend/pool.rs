@@ -133,18 +133,22 @@ impl Pool {
         }
     }
 
-    fn candidates(&self, ctx: &Ctx, role: Role) -> Vec<RoleEntry> {
+    /// The role's own entries, then (with `spillover`) every other backend. The
+    /// `bool` is true for a spillover entry: it may serve only while every listed
+    /// backend is paused or unavailable, never just because it has more free slots.
+    fn candidates(&self, ctx: &Ctx, role: Role) -> Vec<(RoleEntry, bool)> {
         self.apply_pending_roles(ctx);
         let live = self.inner.lock().unwrap().overrides.get(&role).cloned();
-        let mut out: Vec<RoleEntry> = live.unwrap_or_else(|| ctx.cfg.entries_for(role).to_vec());
+        let mut out: Vec<(RoleEntry, bool)> =
+            live.unwrap_or_else(|| ctx.cfg.entries_for(role).to_vec()).into_iter().map(|e| (e, false)).collect();
         if ctx.cfg.policy.spillover {
             for k in BackendKind::ALL {
-                if !out.iter().any(|e| e.backend == k) {
-                    out.push(RoleEntry { backend: k, model: None });
+                if !out.iter().any(|(e, _)| e.backend == k) {
+                    out.push((RoleEntry { backend: k, model: None }, true));
                 }
             }
         }
-        out.retain(|e| self.backends.contains_key(&e.backend));
+        out.retain(|(e, _)| self.backends.contains_key(&e.backend));
         out
     }
 
@@ -190,7 +194,12 @@ impl Pool {
                 let mut best: Option<(usize, RoleEntry)> = None;
                 let mut all_paused = true;
                 let mut earliest: Option<Instant> = None;
-                for e in &cands {
+                let usable = |h: &Health| !h.unavailable && h.paused_until.is_none_or(|t| t <= now);
+                let own_usable = cands.iter().any(|(e, spill)| !spill && usable(&g.health[&e.backend]));
+                for (e, spill) in &cands {
+                    if *spill && own_usable {
+                        continue;
+                    }
                     let h = g.health.get(&e.backend).unwrap();
                     if h.unavailable {
                         continue;
@@ -207,7 +216,7 @@ impl Pool {
                         best = Some((free, e.clone()));
                     }
                 }
-                if cands.iter().all(|e| g.health.get(&e.backend).is_none_or(|h| h.unavailable)) {
+                if cands.iter().all(|(e, _)| g.health.get(&e.backend).is_none_or(|h| h.unavailable)) {
                     return Err(crate::error::VdashError::new(
                         4,
                         format!("every backend for role {role} is unavailable (not logged in?)"),
@@ -216,7 +225,7 @@ impl Pool {
                 if all_paused {
                     let oldest = cands
                         .iter()
-                        .filter_map(|e| g.health.get(&e.backend))
+                        .filter_map(|(e, _)| g.health.get(&e.backend))
                         .filter(|h| !h.unavailable)
                         .filter_map(|h| h.paused_since)
                         .min();
@@ -444,6 +453,27 @@ mod tests {
         fast(&mut pool2);
         let s2 = pool2.run(&ctx2, 1, Role::Critic, &call(Role::Critic)).unwrap();
         assert_eq!(s2.entry.backend, BackendKind::Gemini);
+    }
+
+    #[test]
+    fn spillover_waits_for_a_busy_listed_backend_instead_of_jumping() {
+        // Every role on claude, spillover on: a call made while claude is merely busy
+        // (not paused) must still go to claude, never to the idle gemini.
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_with(&tmp, "\n[policy]\nspillover = true\n[backends.claude]\nmax_concurrent = 1\n");
+        let c = Arc::new(FakeBackend::new(BackendKind::Claude).with_delay(Duration::from_millis(60)));
+        let g = Arc::new(FakeBackend::new(BackendKind::Gemini));
+        c.always(Role::Critic, json!({"from": "claude"}));
+        g.always(Role::Critic, json!({"from": "gemini"}));
+        let mut pool = Pool::new(&ctx, vec![c.clone(), g.clone()]);
+        fast(&mut pool);
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..3).map(|_| sc.spawn(|| pool.run(&ctx, 1, Role::Critic, &call(Role::Critic)).unwrap())).collect();
+            for h in hs {
+                assert_eq!(h.join().unwrap().entry.backend, BackendKind::Claude);
+            }
+        });
+        assert_eq!(g.count(Role::Critic), 0);
     }
 
     #[test]
