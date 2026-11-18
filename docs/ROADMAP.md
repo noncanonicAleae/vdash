@@ -1836,3 +1836,23 @@ Gemini owns M8-03..M8-06.
   session and resume argv cases, `agents::tests::repair_then_success_and_double_failure`
   (repair resumes), `team::tests::declared_names_*`, `tests/worker_followup.rs` (both
   cases need Lean); `tests/engine.rs` `solution_partial_*` now expects 2 worker calls.
+- 2026-11-18 (Gemini): Additional Lean, search, policy, and team-verification
+  performance improvements (user request). (1) `src/engine/team.rs`: parallelized
+  `broken_proved`, `adopt_orphans`, `verify` (worker claims + provisional refutations),
+  and `integrate` (`by_file` + per-lemma fallback `check_decls`) across
+  `max_parallel_lean` slots via `std::thread::scope`. (2) `lean_src/Fingerprint.lean`:
+  memoized `serConstant` + `nextConsts` across targets in `ConstMemo` (`buildClosureMemo`,
+  `fingerprintOneMemo`) and replaced `List` appends with `Array.push`. (3)
+  `src/search.rs`: runs `search_local` and `query_loogle` concurrently, parallelizes
+  `search_roots` across files, and prefilters raw bytes with zero-alloc
+  `contains_ascii_ci`. (4) `src/policy.rs`: `restore_trusted` uses `scan_trusted`
+  (only `Challenge.lean`, `Spec/**`, `.heldout/**`, `@state/anchor.json`) instead of
+  reading `sources/` and `Proof/**` on every worker attempt. (5) `src/lean/imports.rs`:
+  `scan_imports` reads headers incrementally via `read_imports_header` (4 KB chunks)
+  instead of whole proof bodies. (6) `src/lean/slots.rs`: probes from `pid % max` and
+  polls every 50 ms. Tests: `fingerprint_memoizes_shared_closure_across_multiple_targets`,
+  `policy::tests::restore_trusted_restores_trusted_only_without_touching_proofs`,
+  `lean::imports::tests::read_imports_header_handles_large_comments_and_large_bodies`,
+  `search::tests::finds_local_declarations_and_ranks_exact_matches_first` (unicode case);
+  clippy `-D warnings` clean and full `VDASH_TEST_HOST=/home/anachronist/lean_math cargo test --offline`
+  passed (167 passed, 0 failed).

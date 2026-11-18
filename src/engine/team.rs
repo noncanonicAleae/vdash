@@ -283,11 +283,28 @@ fn broken_proved(eng: &Engine, plan: &Plan) -> Result<BTreeSet<String>> {
             by_file.entry(g.file.clone()).or_default().push(g);
         }
     }
+    if by_file.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let checks: Vec<(String, Vec<String>, Vec<String>)> = by_file
+        .into_iter()
+        .map(|(file, gs)| {
+            let names: Vec<String> = gs.iter().filter(|g| g.kind != "repair").map(|g| g.lean_name.clone()).collect();
+            let ids: Vec<String> = gs.into_iter().map(|g| g.id.clone()).collect();
+            (file, names, ids)
+        })
+        .collect();
+    let failed_flags: Vec<bool> = std::thread::scope(|s| {
+        let hs: Vec<_> = checks
+            .iter()
+            .map(|(file, names, _)| s.spawn(move || check_decls(&eng.ctx, file, names).is_err()))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap_or(true)).collect()
+    });
     let mut broken = BTreeSet::new();
-    for (file, gs) in by_file {
-        let names: Vec<String> = gs.iter().filter(|g| g.kind != "repair").map(|g| g.lean_name.clone()).collect();
-        if check_decls(&eng.ctx, &file, &names).is_err() {
-            broken.extend(gs.iter().map(|g| g.id.clone()));
+    for ((_, _, ids), failed) in checks.into_iter().zip(failed_flags) {
+        if failed {
+            broken.extend(ids);
         }
     }
     Ok(broken)
@@ -357,13 +374,25 @@ fn adopt_orphans(eng: &Engine, round: u32, plan: Plan) -> Result<Plan> {
     let candidates: Vec<String> = reach.iter().filter(|m| m.starts_with("Apc.Proof.") && !owned.contains(*m)).cloned().collect();
     let mut repairs = Vec::new();
     if !candidates.is_empty() {
-        // Build each root separately: one broken root must not hide the others' results.
+        // Build each root separately in parallel: one broken root must not hide the others' results.
+        let tree_ref = &tree;
+        let build_dir = eng.ctx.campaign.build_work_dir();
+        let build_dir_ref = &build_dir;
+        let reps: Vec<Option<lean::build::BuildReport>> = std::thread::scope(|s| {
+            let hs: Vec<_> = roots
+                .iter()
+                .map(|r| {
+                    s.spawn(move || {
+                        lean::build::build(&eng.ctx, tree_ref, build_dir_ref, Some(std::slice::from_ref(r))).ok()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().ok().flatten()).collect()
+        });
         let mut results: BTreeMap<String, lean::build::ModuleResult> = BTreeMap::new();
-        for r in &roots {
-            if let Ok(rep) = lean::build::build(&eng.ctx, &tree, &eng.ctx.campaign.build_work_dir(), Some(std::slice::from_ref(r))) {
-                record_module_times(&eng.ctx, &rep);
-                results.extend(rep.results);
-            }
+        for rep in reps.into_iter().flatten() {
+            record_module_times(&eng.ctx, &rep);
+            results.extend(rep.results);
         }
         let bad = |m: &str| results.get(m).is_some_and(|r| !r.ok || r.diagnostics.iter().any(|d| d.kind == "hasSorry"));
         let parent = plan.goals.iter().find(|g| g.kind == "target").map(|g| g.parent_target.clone()).unwrap_or_default();
@@ -1237,7 +1266,21 @@ pub fn verify(eng: &mut Engine, round: u32) -> Result<()> {
             set_rd(eng, &["leads", lid, "escalations_written"], json!(true))?;
         }
     }
-    let mut results: Vec<(String, String, std::result::Result<(), String>, u32)> = Vec::new();
+    struct WorkerClaim {
+        gid: String,
+        file: String,
+        names: Vec<String>,
+        defs: Vec<(String, String)>,
+        goal_name: Option<String>,
+        is_repair: bool,
+    }
+    struct FalsClaim {
+        gid: String,
+        file: String,
+        name: String,
+    }
+    let mut worker_claims = Vec::new();
+    let mut fals_claims = Vec::new();
     for (_lid, l) in leads.as_object().into_iter().flatten() {
         for w in l["workers"].as_array().into_iter().flatten() {
             let gid = w["goal_id"].as_str().unwrap_or("").to_string();
@@ -1253,15 +1296,9 @@ pub fn verify(eng: &mut Engine, round: u32) -> Result<()> {
                 .flatten()
                 .filter_map(|d| Some((d["name"].as_str()?.to_string(), d["witness"].as_str()?.to_string())))
                 .collect();
-            // The goal's own name must be among the proved names.
             let goal_name = plan.as_ref().and_then(|p| p.goal(&gid)).map(|g| g.lean_name.clone());
             let is_repair = plan.as_ref().and_then(|p| p.goal(&gid)).is_some_and(|g| g.kind == "repair");
-            let res = match &goal_name {
-                _ if is_repair => check_decls(&eng.ctx, &file, &[]).map(|_| ()),
-                Some(n) if !names.contains(n) => Err(format!("the reply does not list the goal's theorem {n}")),
-                _ => verify_claim(&eng.ctx, &file, &names, &defs),
-            };
-            results.push((gid, file, res, round));
+            worker_claims.push(WorkerClaim { gid, file, names, defs, goal_name, is_repair });
         }
         // Provisional refutations, now that out-of-scope edits are reverted.
         for f in l["falsifiers"].as_array().into_iter().flatten() {
@@ -1271,21 +1308,55 @@ pub fn verify(eng: &mut Engine, round: u32) -> Result<()> {
             if !provisional {
                 continue;
             }
+            let file = f["file"].as_str().unwrap_or("").to_string();
             let name = r["lean_name"].as_str().unwrap_or("").to_string();
-            let ok = check_decls(&eng.ctx, f["file"].as_str().unwrap_or(""), &[name]).is_ok();
-            eng.update(|s| {
-                if let Some(g) = s.goals.get_mut(&gid) {
-                    g.status = if ok { "refuted".into() } else { "open".into() };
-                }
-            })?;
-            if ok {
-                set_rd(eng, &["next_revise_plan"], json!(true))?;
-                events::emit(&eng.ctx, round, "goal", json!({"id": gid, "status": "refuted"}));
-            } else {
-                eng.bulletin(round, "engine", &format!("the refutation of {gid} did not survive re-checking; the goal is open again"));
-            }
+            fals_claims.push(FalsClaim { gid, file, name });
         }
     }
+
+    let ctx = &eng.ctx;
+    let (worker_outcomes, fals_outcomes): (Vec<std::result::Result<(), String>>, Vec<bool>) = std::thread::scope(|s| {
+        let wh: Vec<_> = worker_claims
+            .iter()
+            .map(|c| {
+                s.spawn(move || match &c.goal_name {
+                    _ if c.is_repair => check_decls(ctx, &c.file, &[]).map(|_| ()),
+                    Some(n) if !c.names.contains(n) => Err(format!("the reply does not list the goal's theorem {n}")),
+                    _ => verify_claim(ctx, &c.file, &c.names, &c.defs),
+                })
+            })
+            .collect();
+        let fh: Vec<_> = fals_claims
+            .iter()
+            .map(|f| s.spawn(move || check_decls(ctx, &f.file, std::slice::from_ref(&f.name)).is_ok()))
+            .collect();
+        let wo = wh
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("verify worker thread panicked".into())))
+            .collect();
+        let fo = fh.into_iter().map(|h| h.join().unwrap_or(false)).collect();
+        (wo, fo)
+    });
+
+    for (f, ok) in fals_claims.into_iter().zip(fals_outcomes) {
+        eng.update(|s| {
+            if let Some(g) = s.goals.get_mut(&f.gid) {
+                g.status = if ok { "refuted".into() } else { "open".into() };
+            }
+        })?;
+        if ok {
+            set_rd(eng, &["next_revise_plan"], json!(true))?;
+            events::emit(&eng.ctx, round, "goal", json!({"id": f.gid, "status": "refuted"}));
+        } else {
+            eng.bulletin(round, "engine", &format!("the refutation of {} did not survive re-checking; the goal is open again", f.gid));
+        }
+    }
+
+    let results: Vec<(String, String, std::result::Result<(), String>, u32)> = worker_claims
+        .into_iter()
+        .zip(worker_outcomes)
+        .map(|(c, res)| (c.gid, c.file, res, round))
+        .collect();
     let mut moved_files: BTreeMap<String, String> = BTreeMap::new();
     for (gid, file, res, r) in results {
         let is_target = plan.as_ref().and_then(|p| p.goal(&gid)).is_some_and(|g| g.kind == "target");
@@ -1405,18 +1476,42 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
             .flatten()
             .filter_map(|m| Some((m["lean_name"].as_str()?.to_string(), m["to"].as_str()?.to_string())))
             .collect();
-        // One check per file (one Lean run each); per-lemma only to name the lost ones.
+        // One check per file in parallel; per-lemma in parallel only to name the lost ones.
         let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for g in &work {
             let file = moved.get(&g.lean_name).cloned().unwrap_or_else(|| g.file.clone());
             by_file.entry(file).or_default().push(g.lean_name.clone());
         }
-        for (file, names) in &by_file {
-            if check_decls(&eng.ctx, file, names).is_err() {
+        let ctx = &eng.ctx;
+        let file_entries: Vec<(String, Vec<String>)> = by_file.into_iter().collect();
+        let file_oks: Vec<bool> = std::thread::scope(|s| {
+            let hs: Vec<_> = file_entries
+                .iter()
+                .map(|(file, names)| s.spawn(move || check_decls(ctx, file, names).is_ok()))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+        });
+        let mut to_bisect: Vec<(&str, &str)> = Vec::new();
+        for ((file, names), ok) in file_entries.iter().zip(file_oks) {
+            if !ok {
                 for n in names {
-                    if check_decls(&eng.ctx, file, std::slice::from_ref(n)).is_err() {
-                        lost.push(n.clone());
-                    }
+                    to_bisect.push((file.as_str(), n.as_str()));
+                }
+            }
+        }
+        if !to_bisect.is_empty() {
+            let per_name_oks: Vec<bool> = std::thread::scope(|s| {
+                let hs: Vec<_> = to_bisect
+                    .iter()
+                    .map(|&(file, n)| {
+                        s.spawn(move || check_decls(ctx, file, &[n.to_string()]).is_ok())
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+            });
+            for ((_, n), ok) in to_bisect.into_iter().zip(per_name_oks) {
+                if !ok {
+                    lost.push(n.to_string());
                 }
             }
         }
