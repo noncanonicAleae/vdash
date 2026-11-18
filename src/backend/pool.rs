@@ -14,6 +14,9 @@ use crate::config::{BackendKind, Role, RoleEntry};
 use crate::events;
 use crate::paths::Ctx;
 
+/// Added to a CLI-reported reset time, so the probe lands after the reset.
+const QUOTA_SLACK: Duration = Duration::from_secs(20);
+
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub base: Duration,
@@ -65,6 +68,8 @@ pub struct Pool {
 pub struct Served {
     pub result: AgentResult,
     pub entry: RoleEntry,
+    /// Time spent waiting for a slot or for a paused backend, not running the CLI.
+    pub waited: Duration,
 }
 
 impl Pool {
@@ -179,6 +184,9 @@ impl Pool {
         on_pick: &dyn Fn(&RoleEntry),
     ) -> crate::error::Result<Served> {
         let mut retried_transient: BTreeMap<BackendKind, bool> = BTreeMap::new();
+        let t0 = Instant::now();
+        let mut ran = Duration::ZERO;
+        let prefer = call.resume.as_ref().map(|r| r.session.backend);
         loop {
             let cands = self.candidates(ctx, role);
             if cands.is_empty() {
@@ -211,7 +219,15 @@ impl Pool {
                         }
                     }
                     all_paused = false;
-                    let free = h.max.saturating_sub(h.in_use);
+                    // A backend coming back from a usage limit gets one call (the
+                    // probe) until a call succeeds, so a still-exhausted limit costs
+                    // one failed call, not one per waiting thread.
+                    let max = if h.step > 0 { 1 } else { h.max };
+                    let mut free = max.saturating_sub(h.in_use);
+                    // The backend holding the session to resume wins when it has room.
+                    if free > 0 && prefer == Some(e.backend) {
+                        free = usize::MAX;
+                    }
                     if free > 0 && best.as_ref().is_none_or(|(f, _)| free > *f) {
                         best = Some((free, e.clone()));
                     }
@@ -263,7 +279,17 @@ impl Pool {
             let backend = self.backends[&entry.backend].clone();
             let mut c = call.clone();
             c.model = entry.model.clone();
+            match c.resume.take() {
+                Some(r) if r.session.backend == entry.backend => {
+                    c.prompt = r.prompt.clone();
+                    c.resume = Some(r);
+                }
+                _ => {}
+            }
+            let started = Instant::now();
             let result = backend.run(ctx, &c);
+            ran += started.elapsed();
+            let waited = t0.elapsed().saturating_sub(ran);
             // Release and update health.
             let mut g = self.inner.lock().unwrap();
             let h = g.health.get_mut(&entry.backend).unwrap();
@@ -274,16 +300,50 @@ impl Pool {
                 Some(_) if stopping => {
                     drop(g);
                     self.cv.notify_all();
-                    return Ok(Served { result, entry });
+                    return Ok(Served { result, entry, waited });
                 }
                 Some(Failure::Quota) => {
-                    h.paused_since.get_or_insert_with(Instant::now);
-                    let d = (self.timing.base * 2u32.saturating_pow(h.step)).min(self.timing.cap);
-                    h.step = h.step.saturating_add(1);
-                    h.paused_until = Some(Instant::now() + d);
+                    let now = Instant::now();
+                    let already = h.paused_until.is_some_and(|t| t > now);
+                    h.paused_since.get_or_insert(now);
+                    // The CLI's own reset time, when it gave one; otherwise
+                    // exponential backoff, one step per pause (calls already in
+                    // flight that hit the same limit do not double it again).
+                    let d = match result.retry_after {
+                        Some(r) => {
+                            h.step = h.step.max(1);
+                            Some((r + QUOTA_SLACK).clamp(Duration::from_secs(5), self.timing.max_wait.max(Duration::from_secs(5))))
+                        }
+                        None if already => None,
+                        None => {
+                            let d = (self.timing.base * 2u32.saturating_pow(h.step)).min(self.timing.cap);
+                            h.step = h.step.saturating_add(1);
+                            Some(d)
+                        }
+                    };
+                    let extended = match d {
+                        Some(d) if h.paused_until.is_none_or(|t| t < now + d) => {
+                            h.paused_until = Some(now + d);
+                            Some(d)
+                        }
+                        _ => None,
+                    };
                     drop(g);
                     self.cv.notify_all();
-                    events::emit(ctx, round, "backend_paused", json!({"backend": entry.backend.to_string(), "seconds": d.as_secs_f64()}));
+                    if let Some(d) = extended {
+                        let msg = if result.text.trim().is_empty() { &result.raw } else { &result.text };
+                        events::emit(
+                            ctx,
+                            round,
+                            "backend_paused",
+                            json!({
+                                "backend": entry.backend.to_string(),
+                                "seconds": d.as_secs_f64(),
+                                "reset_known": result.retry_after.is_some(),
+                                "message": crate::util::clip(msg.trim(), 300, false),
+                            }),
+                        );
+                    }
                     continue;
                 }
                 Some(Failure::NotLoggedIn) => {
@@ -311,7 +371,7 @@ impl Pool {
                     if was_paused && result.failure.is_none() {
                         events::emit(ctx, round, "backend_resumed", json!({"backend": entry.backend.to_string()}));
                     }
-                    return Ok(Served { result, entry });
+                    return Ok(Served { result, entry, waited });
                 }
             }
         }
@@ -352,7 +412,87 @@ mod tests {
             profile: Profile::Readonly,
             model: None,
             timeout: Duration::from_secs(5),
+            resume: None,
         }
+    }
+
+    fn paused_events(ctx: &Ctx) -> Vec<events::Event> {
+        events::tail(&ctx.campaign.events_file(), 100).0.into_iter().filter(|e| e.kind == "backend_paused").collect()
+    }
+
+    #[test]
+    fn concurrent_quota_failures_pause_once_and_one_probe_runs_after() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_with(&tmp, "\n[roles]\ncritic = [\"claude\"]\n");
+        let c = Arc::new(FakeBackend::new(BackendKind::Claude).with_delay(Duration::from_millis(40)));
+        for _ in 0..4 {
+            c.fail(Role::Critic, Failure::Quota);
+        }
+        c.always(Role::Critic, json!({}));
+        let mut pool = Pool::new(&ctx, vec![c.clone()]);
+        fast(&mut pool);
+        std::thread::scope(|s| {
+            let hs: Vec<_> = (0..4).map(|_| s.spawn(|| pool.run(&ctx, 1, Role::Critic, &call(Role::Critic)).unwrap())).collect();
+            for h in hs {
+                assert!(h.join().unwrap().result.failure.is_none());
+            }
+        });
+        // Four calls hit the limit together: one pause, one backoff step, not four.
+        assert_eq!(paused_events(&ctx).len(), 1);
+        assert_eq!(pool.health()[&BackendKind::Claude].step, 0);
+        assert_eq!(c.count(Role::Critic), 8);
+    }
+
+    #[test]
+    fn cli_reset_time_sets_the_pause_instead_of_backoff() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_with(&tmp, "\n[roles]\ncritic = [\"claude\"]\n");
+        let c = Arc::new(FakeBackend::new(BackendKind::Claude));
+        c.push(Role::Critic, crate::backend::fake::Step::QuotaFor(Duration::from_secs(3600)));
+        let mut pool = Pool::new(&ctx, vec![c.clone()]);
+        pool.timing = Timing { base: Duration::from_millis(20), cap: Duration::from_millis(200), max_wait: Duration::from_secs(7200) };
+        let probe = std::thread::spawn({
+            let flag = Arc::new(AtomicBool::new(false));
+            pool.set_stop(flag.clone());
+            move || {
+                std::thread::sleep(Duration::from_millis(300));
+                flag.store(true, AtomicOrdering::SeqCst);
+            }
+        });
+        let r = pool.run(&ctx, 1, Role::Critic, &call(Role::Critic));
+        probe.join().unwrap();
+        // Paused for the reported hour (not 20ms backoff), so the stop arrived first.
+        assert!(r.is_err() && c.count(Role::Critic) == 1);
+        let left = pool.health()[&BackendKind::Claude].paused_until.unwrap().saturating_duration_since(Instant::now());
+        assert!(left > Duration::from_secs(3500), "{left:?}");
+        let ev = &paused_events(&ctx)[0];
+        assert_eq!(ev.data["reset_known"], true);
+    }
+
+    #[test]
+    fn resume_prefers_the_session_backend_and_sends_the_short_prompt() {
+        use crate::backend::{Resume, Session};
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_with(&tmp, "");
+        let c = Arc::new(FakeBackend::new(BackendKind::Claude));
+        let g = Arc::new(FakeBackend::new(BackendKind::Gemini));
+        c.always(Role::Worker, json!({}));
+        g.always(Role::Worker, json!({}));
+        let pool = Pool::new(&ctx, vec![c.clone(), g.clone()]);
+        let mut cl = call(Role::Worker);
+        cl.prompt = "FULL".into();
+        cl.resume = Some(Resume { session: Session { backend: BackendKind::Gemini, id: "s1".into() }, prompt: "SHORT".into() });
+        let s = pool.run(&ctx, 1, Role::Worker, &cl).unwrap();
+        assert_eq!(s.entry.backend, BackendKind::Gemini);
+        let gc = g.calls.lock().unwrap();
+        assert_eq!((gc[0].prompt.as_str(), gc[0].resumed.as_deref()), ("SHORT", Some("s1")));
+        drop(gc);
+        // The session backend is gone: the call runs fresh elsewhere with the full prompt.
+        pool.mark_unavailable(BackendKind::Gemini);
+        let s = pool.run(&ctx, 1, Role::Worker, &cl).unwrap();
+        assert_eq!(s.entry.backend, BackendKind::Claude);
+        let cc = c.calls.lock().unwrap();
+        assert_eq!((cc[0].prompt.as_str(), cc[0].resumed.as_deref()), ("FULL", None));
     }
 
     fn fast(p: &mut Pool) {

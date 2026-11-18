@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -15,14 +16,16 @@ impl<'a> HeaderScanner<'a> {
         Self { rest: text }
     }
 
-    fn skip_ws_and_comments(&mut self) {
+    fn skip_ws_and_comments_checked(&mut self, eof: bool) -> bool {
         loop {
             self.rest = self.rest.trim_start();
             if self.rest.starts_with("--") {
                 if let Some(nl) = self.rest.find('\n') {
                     self.rest = &self.rest[nl + 1..];
-                } else {
+                } else if eof {
                     self.rest = "";
+                } else {
+                    return false;
                 }
                 continue;
             }
@@ -42,71 +45,89 @@ impl<'a> HeaderScanner<'a> {
                     }
                 }
                 if depth > 0 {
-                    self.rest = "";
+                    if eof {
+                        self.rest = "";
+                    } else {
+                        return false;
+                    }
                 } else {
                     self.rest = &self.rest[idx..];
                 }
                 continue;
             }
+            if !eof && (self.rest.is_empty() || self.rest == "/" || self.rest == "-") {
+                return false;
+            }
             break;
         }
+        true
     }
 
-    fn peek_token(&mut self) -> Option<&'a str> {
-        self.skip_ws_and_comments();
-        if self.rest.is_empty() {
+    fn peek_token_checked(&mut self, eof: bool) -> Option<Option<&'a str>> {
+        if !self.skip_ws_and_comments_checked(eof) {
             return None;
         }
+        if self.rest.is_empty() {
+            return Some(None);
+        }
         let mut end = self.rest.len();
+        let mut terminated = false;
         for (i, ch) in self.rest.char_indices() {
             if ch.is_whitespace() {
                 end = i;
+                terminated = true;
                 break;
             }
             if self.rest[i..].starts_with("--") || self.rest[i..].starts_with("/-") {
                 end = i;
+                terminated = true;
                 break;
             }
         }
+        if !terminated && !eof {
+            return None;
+        }
         if end == 0 {
-            None
+            Some(None)
         } else {
-            Some(&self.rest[..end])
+            Some(Some(&self.rest[..end]))
         }
     }
 
-    fn next_token(&mut self) -> Option<&'a str> {
-        let tok = self.peek_token()?;
-        self.rest = &self.rest[tok.len()..];
+    fn next_token_checked(&mut self, eof: bool) -> Option<Option<&'a str>> {
+        let tok = self.peek_token_checked(eof)?;
+        if let Some(t) = tok {
+            self.rest = &self.rest[t.len()..];
+        }
         Some(tok)
     }
 }
 
-pub fn parse_imports(text: &str) -> Vec<String> {
+fn parse_imports_prefix(text: &str, eof: bool) -> Option<Vec<String>> {
     let mut scan = HeaderScanner::new(text);
 
     // Optional leading `module` and/or `prelude`
-    while let Some("module") | Some("prelude") = scan.peek_token() {
-        let _ = scan.next_token();
+    while let Some("module") | Some("prelude") = scan.peek_token_checked(eof)? {
+        let _ = scan.next_token_checked(eof)?;
     }
 
     let mut imports = Vec::new();
     loop {
         // Optional visibility / phase modifiers before `import`
-        while let Some("public") | Some("private") | Some("meta") = scan.peek_token() {
-            let _ = scan.next_token();
+        while let Some("public") | Some("private") | Some("meta") = scan.peek_token_checked(eof)? {
+            let _ = scan.next_token_checked(eof)?;
         }
 
-        if scan.peek_token() != Some("import") {
+        if scan.peek_token_checked(eof)? != Some("import") {
             break;
         }
-        let _ = scan.next_token(); // consume `import`
+        let _ = scan.next_token_checked(eof)?; // consume `import`
 
-        if scan.peek_token() == Some("all") {
-            let _ = scan.next_token();
+        if scan.peek_token_checked(eof)? == Some("all") {
+            let _ = scan.next_token_checked(eof)?;
         }
 
-        match scan.next_token() {
+        match scan.next_token_checked(eof)? {
             Some(mod_name) if !mod_name.is_empty() => {
                 imports.push(mod_name.to_string());
             }
@@ -114,7 +135,42 @@ pub fn parse_imports(text: &str) -> Vec<String> {
         }
     }
 
-    imports
+    Some(imports)
+}
+
+pub fn parse_imports(text: &str) -> Vec<String> {
+    parse_imports_prefix(text, true).unwrap_or_default()
+}
+
+fn read_imports_header(path: &Path) -> Result<Vec<String>> {
+    let mut file = fs::File::open(path).map_err(|e| VdashError::io_path(path, e))?;
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| VdashError::io_path(path, e))?;
+        let eof = n == 0;
+        buf.extend_from_slice(&chunk[..n]);
+        let valid_len = match std::str::from_utf8(&buf) {
+            Ok(_) => buf.len(),
+            Err(e) if !eof && e.error_len().is_none() => e.valid_up_to(),
+            Err(e) => {
+                return Err(VdashError::new(
+                    2,
+                    format!("invalid utf-8 in {}: {e}", path.display()),
+                ))
+            }
+        };
+        let text = std::str::from_utf8(&buf[..valid_len])
+            .map_err(|e| VdashError::new(2, format!("invalid utf-8 in {}: {e}", path.display())))?;
+        if let Some(imports) = parse_imports_prefix(text, eof && valid_len == buf.len()) {
+            return Ok(imports);
+        }
+        if eof {
+            return Ok(parse_imports(text));
+        }
+    }
 }
 
 fn tree_rel_to_module(rel: &Path) -> Result<String> {
@@ -170,9 +226,8 @@ pub fn scan_imports(tree: &Path) -> Result<ImportScan> {
             .strip_prefix(tree)
             .map_err(|_| VdashError::new(2, format!("path outside tree: {}", path.display())))?;
         let mod_name = tree_rel_to_module(rel)?;
-        let content = fs::read_to_string(path).map_err(|e| VdashError::io_path(path, e))?;
         let mut deps = Vec::new();
-        for imp in parse_imports(&content) {
+        for imp in read_imports_header(path)? {
             if imp.starts_with("Apc.") && !deps.contains(&imp) {
                 deps.push(imp);
             }
@@ -469,5 +524,24 @@ def x : Nat := 1
             "unexpected cycle message: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn read_imports_header_handles_large_comments_and_large_bodies() {
+        let tmp = TempDir::new().unwrap();
+        let big_comment = format!("/-\n{}\n-/\n", "x".repeat(5000));
+        let mut many_imports = String::new();
+        for i in 0..250 {
+            many_imports.push_str(&format!("import Apc.Mod{i:03}\n"));
+        }
+        let big_body = format!("\ntheorem t : True := by\n  -- {}\n  trivial\n", "y".repeat(6000));
+        let full = format!("{big_comment}{many_imports}{big_body}");
+        let p = tmp.path().join("Big.lean");
+        fs::write(&p, &full).unwrap();
+
+        let from_header = read_imports_header(&p).unwrap();
+        let from_full = parse_imports(&full);
+        assert_eq!(from_header, from_full);
+        assert_eq!(from_header.len(), 250);
     }
 }

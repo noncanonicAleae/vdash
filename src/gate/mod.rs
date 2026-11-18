@@ -1,17 +1,21 @@
 pub mod scan;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use walkdir::WalkDir;
 
 use crate::anchor;
 use crate::error::{VdashError, Result};
 use crate::fingerprint;
+use crate::jsonio;
 use crate::lean;
 use crate::paths::{Ctx, TargetState};
 use crate::proc;
@@ -102,7 +106,221 @@ fn reject_all(
     }
 }
 
+struct GateLock(fs::File);
+
+impl Drop for GateLock {
+    fn drop(&mut self) {
+        let _ = flock(&self.0, FlockOperation::Unlock);
+    }
+}
+
+fn acquire_gate_lock(cache_root: &Path) -> Result<GateLock> {
+    fs::create_dir_all(cache_root).map_err(|e| VdashError::io_path(cache_root, e))?;
+    let lock_path = cache_root.join("gate.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| VdashError::io_path(&lock_path, e))?;
+    flock(&file, FlockOperation::LockExclusive)
+        .map_err(|e| VdashError::new(5, format!("cannot lock {}: {e}", lock_path.display())))?;
+    Ok(GateLock(file))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedSolFps {
+    version: u32,
+    sol_key: String,
+    target_names: Vec<String>,
+    fps: fingerprint::Fingerprints,
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex
+}
+
+fn module_rel_stem(module: &str) -> PathBuf {
+    let mut p = PathBuf::new();
+    for part in module.split('.') {
+        p.push(part);
+    }
+    p
+}
+
+fn module_olean_path(build_dir: &Path, module: &str) -> PathBuf {
+    let mut p = build_dir.join(module_rel_stem(module));
+    p.set_extension("olean");
+    p
+}
+
+fn olean_lc_marker_path(olean: &Path) -> PathBuf {
+    let mut os = olean.as_os_str().to_os_string();
+    os.push(".lc_ok");
+    PathBuf::from(os)
+}
+
+fn expected_lc_marker(olean_path: &Path, module_key: &str) -> Option<String> {
+    let bytes = fs::read(olean_path).ok()?;
+    Some(format!("{module_key} {}\n", sha256_hex_bytes(&bytes)))
+}
+
+fn prune_stale_build_files(build_dir: &Path, keep_modules: &BTreeSet<String>) {
+    let apc_dir = build_dir.join("Apc");
+    if !apc_dir.is_dir() {
+        return;
+    }
+    let suffixes = [
+        ".olean.diag.json",
+        ".olean.key",
+        ".olean.lc_ok",
+        ".olean.lock",
+        ".olean",
+    ];
+    for entry in WalkDir::new(&apc_dir).follow_links(false).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(build_dir) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let Some(stem) = suffixes.iter().find_map(|sfx| rel_str.strip_suffix(sfx)) else {
+            continue;
+        };
+        let mod_name = stem.replace('/', ".");
+        if !keep_modules.contains(&mod_name) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn prune_old_chal_fps(cache_root: &Path, keep_name: &str) {
+    let Ok(rd) = fs::read_dir(cache_root) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let fname = entry.file_name();
+        let s = fname.to_string_lossy();
+        if s.starts_with("chal_fps_") && s.ends_with(".json") && s != keep_name {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn hash_dir_files(hasher: &mut Sha256, label: &[u8], dir: &Path) {
+    hasher.update(label);
+    let mut files: Vec<PathBuf> = Vec::new();
+    if dir.is_dir() {
+        for entry in WalkDir::new(dir).follow_links(false).into_iter().flatten() {
+            if entry.file_type().is_file() {
+                if let Ok(rel) = entry.path().strip_prefix(dir) {
+                    files.push(rel.to_path_buf());
+                }
+            }
+        }
+    }
+    files.sort();
+    for rel in files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = fs::read(dir.join(&rel)) {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        } else {
+            hasher.update(b"<unreadable>");
+        }
+        hasher.update(b"\n");
+    }
+}
+
+/// Cryptographic digest of every input that [`run`] depends on, used by the
+/// engine to skip redundant `gate_pre` / `gate_post` executions when nothing
+/// in `.heldout/`, `amendments/`, `Apc.Solution`'s closure, or policy changed.
+pub fn input_digest(ctx: &Ctx) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"gate-input-v1\n");
+    hasher.update(ctx.cfg.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update([u8::from(ctx.cfg.use_mathlib)]);
+    hasher.update([u8::from(ctx.cfg.policy.kernel_recheck)]);
+    hasher.update(ctx.cfg.policy.comparator_cmd.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(ctx.cfg.host_project.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    if let Ok(tc) = lean::toolchain(&ctx.cfg) {
+        hasher.update(tc.as_bytes());
+    }
+    hasher.update(b"\0");
+    if let Ok(lp) = lean::lean_path(ctx, Path::new("")) {
+        hasher.update(lp.as_bytes());
+    }
+    hasher.update(b"\n");
+
+    let anc_path = anchor::anchor_path(ctx);
+    if let Ok(bytes) = fs::read(&anc_path) {
+        hasher.update(b"anchor:");
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+
+    hash_dir_files(&mut hasher, b"heldout:\n", &ctx.campaign.heldout_dir());
+    hash_dir_files(&mut hasher, b"amendments:\n", &ctx.campaign.amendments_dir());
+
+    let lean_dir = ctx.campaign.lean_dir();
+    if !ctx.campaign.solution_file().is_file() {
+        hasher.update(b"sol:missing\n");
+    } else {
+        let mut scan = lean::imports::scan_imports(&lean_dir)?;
+        // `gate::run` copies `lean/` without `Apc/Challenge.lean`, so remove it
+        // from the import graph before computing `Apc.Solution`'s closure.
+        scan.graph.remove("Apc.Challenge");
+        scan.rel_paths.remove("Apc.Challenge");
+        let sol_target = ["Apc.Solution".to_string()];
+        let closure = lean::imports::closure_of(&scan.graph, &sol_target);
+        hasher.update(b"sol_closure:\n");
+        for m in closure {
+            hasher.update(m.as_bytes());
+            hasher.update(b"\0");
+            if let Some(rel) = scan.rel_paths.get(&m) {
+                let p = lean_dir.join(rel);
+                if let Ok(bytes) = fs::read(&p) {
+                    hasher.update((bytes.len() as u64).to_le_bytes());
+                    hasher.update(&bytes);
+                }
+            } else {
+                hasher.update(b"<missing>");
+            }
+            hasher.update(b"\n");
+        }
+    }
+
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
 pub fn run(ctx: &Ctx) -> Result<Verdict> {
+    run_with_opts(ctx, false)
+}
+
+pub fn run_fresh(ctx: &Ctx) -> Result<Verdict> {
+    run_with_opts(ctx, true)
+}
+
+pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
     // Step 0: anchor::verify
     let anchor_problems = anchor::verify(ctx);
     if !anchor_problems.is_empty() {
@@ -118,37 +336,94 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
         ));
     }
 
-    // Step 1: Create two fresh temp dirs inside .build/gate
+    let cache_root = ctx.state_dir.join("gate_cache");
+    let _gate_lock = if fresh {
+        None
+    } else {
+        Some(acquire_gate_lock(&cache_root)?)
+    };
+
+    // Temp work directory inside .build/gate for tree copies (and fresh build dirs when `fresh`).
     let gate_base = ctx.campaign.build_gate_dir();
     fs::create_dir_all(&gate_base).map_err(|e| VdashError::io_path(&gate_base, e))?;
     let tmp = TempDir::new_in(&gate_base).map_err(|e| VdashError::io_path(&gate_base, e))?;
 
-    let chal_tree = tmp.path().join("chal_tree");
-    let chal_build = tmp.path().join("chal_build");
-    let sol_tree = tmp.path().join("sol_tree");
-    let sol_build = tmp.path().join("sol_build");
-    fs::create_dir_all(&chal_build).map_err(|e| VdashError::io_path(&chal_build, e))?;
-    fs::create_dir_all(&sol_build).map_err(|e| VdashError::io_path(&sol_build, e))?;
+    let need_chal_build = !ctx.cfg.policy.comparator_cmd.trim().is_empty();
+    let tc = lean::toolchain(&ctx.cfg)?;
+    let host_lp = lean::lean_path(ctx, Path::new(""))?;
+    let anchor_manifest_hash = jsonio::read_json::<anchor::Anchor>(anchor::anchor_path(ctx))
+        .map(|a| a.manifest_hash)
+        .unwrap_or_default();
+    let chal_key = sha256_hex_bytes(
+        format!("chal-v1\0{anchor_manifest_hash}\0{tc}\0{host_lp}").as_bytes(),
+    );
+    let chal_fps_name = format!("chal_fps_{chal_key}.json");
+    let chal_fps_path = cache_root.join(&chal_fps_name);
 
-    util::copy_tree(&ctx.campaign.heldout_tree(), &chal_tree, &|_| false)?;
+    let cached_chal_fps = if !fresh && chal_fps_path.is_file() {
+        jsonio::read_json::<fingerprint::Fingerprints>(&chal_fps_path).ok()
+    } else {
+        None
+    };
+
+    // Step 1a + 2a: Challenge tree, build, and fingerprint (reusing state_dir cache when !fresh).
+    let chal_tree = tmp.path().join("chal_tree");
+    let chal_build = if fresh {
+        tmp.path().join("chal_build")
+    } else {
+        cache_root.join("chal_build")
+    };
+
+    let chal_fps = match (cached_chal_fps, need_chal_build) {
+        (Some(fps), false) => fps,
+        (maybe_fps, _) => {
+            fs::create_dir_all(&chal_build).map_err(|e| VdashError::io_path(&chal_build, e))?;
+            util::copy_tree(&ctx.campaign.heldout_tree(), &chal_tree, &|_| false)?;
+            let chal_targets = if need_chal_build {
+                None
+            } else {
+                Some(vec!["Apc.Challenge".to_string()])
+            };
+            let chal_rep = lean::build::build(ctx, &chal_tree, &chal_build, chal_targets.as_deref())
+                .map_err(|e| VdashError::new(5, format!("challenge build failed: {}", e.message)))?;
+            if !chal_rep.ok {
+                return Err(VdashError::new(
+                    5,
+                    "held-out challenge tree failed to compile".to_string(),
+                ));
+            }
+            if !fresh && need_chal_build {
+                let keep: BTreeSet<String> = chal_rep.results.keys().cloned().collect();
+                prune_stale_build_files(&chal_build, &keep);
+            }
+            if let Some(fps) = maybe_fps {
+                fps
+            } else {
+                let fps = fingerprint::targets(ctx, &chal_tree, &chal_build).map_err(|e| {
+                    VdashError::new(5, format!("challenge fingerprint failed: {}", e.message))
+                })?;
+                if !fresh {
+                    prune_old_chal_fps(&cache_root, &chal_fps_name);
+                    let _ = jsonio::write_atomic(&chal_fps_path, &fps);
+                }
+                fps
+            }
+        }
+    };
+    let target_names: Vec<String> = chal_fps.keys().cloned().collect();
+
+    // Step 1b + 2b: Copy solution tree (without Apc/Challenge.lean) and build Apc.Solution closure.
+    let sol_tree = tmp.path().join("sol_tree");
+    let sol_build = if fresh {
+        tmp.path().join("sol_build")
+    } else {
+        cache_root.join("sol_build")
+    };
+    fs::create_dir_all(&sol_build).map_err(|e| VdashError::io_path(&sol_build, e))?;
     util::copy_tree(&ctx.campaign.lean_dir(), &sol_tree, &|rel| {
         rel == Path::new("Apc/Challenge.lean")
     })?;
 
-    // Step 2a: Build Challenge tree from scratch (internal fault -> code 5)
-    let chal_rep = lean::build::build(ctx, &chal_tree, &chal_build, None)
-        .map_err(|e| VdashError::new(5, format!("challenge build failed: {}", e.message)))?;
-    if !chal_rep.ok {
-        return Err(VdashError::new(
-            5,
-            "held-out challenge tree failed to compile".to_string(),
-        ));
-    }
-    let chal_fps = fingerprint::targets(ctx, &chal_tree, &chal_build)
-        .map_err(|e| VdashError::new(5, format!("challenge fingerprint failed: {}", e.message)))?;
-    let target_names: Vec<String> = chal_fps.keys().cloned().collect();
-
-    // Step 2b: Build Solution (Apc.Solution and its import closure)
     if !sol_tree.join("Apc/Solution.lean").is_file() {
         return Ok(reject_all(
             target_names,
@@ -160,19 +435,20 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
     }
 
     let sol_target = ["Apc.Solution".to_string()];
-    let sol_rep = match lean::build::build(ctx, &sol_tree, &sol_build, Some(&sol_target)) {
-        Ok(r) => r,
-        Err(e) if e.code == 1 => {
-            return Ok(reject_all(
-                target_names,
-                ReasonCode::BuildFailed,
-                serde_json::json!({ "error": e.message }),
-                true,
-                vec!["build_failed".to_string()],
-            ));
-        }
-        Err(e) => return Err(e),
-    };
+    let (sol_rep, sol_keys) =
+        match lean::build::build_with_keys(ctx, &sol_tree, &sol_build, Some(&sol_target)) {
+            Ok(r) => r,
+            Err(e) if e.code == 1 => {
+                return Ok(reject_all(
+                    target_names,
+                    ReasonCode::BuildFailed,
+                    serde_json::json!({ "error": e.message }),
+                    true,
+                    vec!["build_failed".to_string()],
+                ));
+            }
+            Err(e) => return Err(e),
+        };
 
     if !sol_rep.ok {
         let mut errs = Vec::new();
@@ -199,6 +475,11 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
     // Only the solution's own closure matters; a broken import elsewhere must not fail the gate.
     let sol_graph = lean::imports::scan_imports(&sol_tree)?.graph;
     let sol_closure = lean::imports::closure_of(&sol_graph, &sol_target);
+    if !fresh {
+        prune_stale_build_files(&sol_build, &sol_closure);
+    }
+
+    let heldout_tree = ctx.campaign.heldout_tree();
     let untrusted_mods: Vec<String> = sol_closure
         .into_iter()
         .filter(|m| {
@@ -210,7 +491,7 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
                 rel.push(part);
             }
             rel.set_extension("lean");
-            let held_file = chal_tree.join(&rel);
+            let held_file = heldout_tree.join(&rel);
             let sol_file = sol_tree.join(&rel);
             match (fs::read(&held_file), fs::read(&sol_file)) {
                 (Ok(hb), Ok(sb)) => hb != sb,
@@ -230,26 +511,85 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
         ));
     }
 
-    // Step 4: kernel_recheck via leanchecker on each untrusted module of the closure
+    // Step 4: kernel_recheck via leanchecker in parallel across `max_parallel_lean` slots,
+    // skipping modules whose `(cache_key, olean_sha256)` already passed in `state_dir`.
     if ctx.cfg.policy.kernel_recheck {
         let sol_lp = lean::lean_path(ctx, &sol_build)?;
+        let mut to_check: Vec<(String, Option<(PathBuf, String)>)> = Vec::new();
         for m in &untrusted_mods {
-            let _slot = lean::slots::acquire(ctx)?;
-            let mut lc_cmd = lean::command(ctx, "leanchecker")?;
-            lc_cmd.env("LEAN_PATH", &sol_lp).arg(m);
-            let out = proc::run(
-                &mut lc_cmd,
-                None,
-                Duration::from_secs(ctx.cfg.budget.lean_timeout_s),
-            )?;
-            if out.timed_out || out.status != Some(0) {
+            if !fresh {
+                if let Some(m_key) = sol_keys.get(m) {
+                    let olean_path = module_olean_path(&sol_build, m);
+                    let marker_path = olean_lc_marker_path(&olean_path);
+                    if let Some(expected) = expected_lc_marker(&olean_path, m_key) {
+                        if fs::read_to_string(&marker_path).ok().as_deref() == Some(expected.as_str()) {
+                            continue;
+                        }
+                        to_check.push((m.clone(), Some((marker_path, expected))));
+                        continue;
+                    }
+                }
+            }
+            to_check.push((m.clone(), None));
+        }
+
+        if !to_check.is_empty() {
+            let sol_lp_ref = sol_lp.as_str();
+            let lc_results: Vec<Result<std::result::Result<(), (bool, String)>>> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = to_check
+                        .iter()
+                        .map(|(m, _)| {
+                            s.spawn(move || {
+                                let _slot = lean::slots::acquire(ctx)?;
+                                let mut lc_cmd = lean::command(ctx, "leanchecker")?;
+                                lc_cmd.env("LEAN_PATH", sol_lp_ref).arg(m);
+                                let out = proc::run(
+                                    &mut lc_cmd,
+                                    None,
+                                    Duration::from_secs(ctx.cfg.budget.lean_timeout_s),
+                                )?;
+                                if out.timed_out || out.status != Some(0) {
+                                    Ok(Err((out.timed_out, out.stderr_lossy().trim().to_string())))
+                                } else {
+                                    Ok(Ok(()))
+                                }
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err(VdashError::new(5, "leanchecker thread panicked")))
+                        })
+                        .collect()
+                });
+
+            let mut first_fail: Option<(String, bool, String)> = None;
+            for ((m, marker), res) in to_check.into_iter().zip(lc_results) {
+                match res? {
+                    Ok(()) => {
+                        if let Some((marker_path, expected)) = marker {
+                            let _ = fs::write(&marker_path, expected);
+                        }
+                    }
+                    Err((timed_out, stderr)) => {
+                        if first_fail.is_none() {
+                            first_fail = Some((m, timed_out, stderr));
+                        }
+                    }
+                }
+            }
+
+            if let Some((m, timed_out, stderr)) = first_fail {
                 return Ok(reject_all(
                     target_names,
                     ReasonCode::KernelRecheckFailed,
                     serde_json::json!({
                         "module": m,
-                        "timed_out": out.timed_out,
-                        "stderr": out.stderr_lossy().trim()
+                        "timed_out": timed_out,
+                        "stderr": stderr,
                     }),
                     true,
                     vec!["kernel_recheck_failed".to_string()],
@@ -258,8 +598,36 @@ pub fn run(ctx: &Ctx) -> Result<Verdict> {
         }
     }
 
-    // Step 5: Fingerprint solution for the challenge target names (root Apc.Solution)
-    let sol_fps = fingerprint::closure(ctx, &sol_tree, &sol_build, "Apc.Solution", &target_names)?;
+    // Step 5: Fingerprint solution for the challenge target names (root Apc.Solution),
+    // reusing `sol_fps.json` when `Apc.Solution`'s build key and `target_names` match.
+    let sol_fps_path = cache_root.join("sol_fps.json");
+    let sol_fps = if !fresh {
+        let cached = sol_keys.get("Apc.Solution").and_then(|sk| {
+            jsonio::read_json::<CachedSolFps>(&sol_fps_path)
+                .ok()
+                .filter(|c| c.version == 1 && &c.sol_key == sk && c.target_names == target_names)
+                .map(|c| c.fps)
+        });
+        match cached {
+            Some(fps) => fps,
+            None => {
+                let fps =
+                    fingerprint::closure(ctx, &sol_tree, &sol_build, "Apc.Solution", &target_names)?;
+                if let Some(sk) = sol_keys.get("Apc.Solution") {
+                    let cached_entry = CachedSolFps {
+                        version: 1,
+                        sol_key: sk.clone(),
+                        target_names: target_names.clone(),
+                        fps: fps.clone(),
+                    };
+                    let _ = jsonio::write_atomic(&sol_fps_path, &cached_entry);
+                }
+                fps
+            }
+        }
+    } else {
+        fingerprint::closure(ctx, &sol_tree, &sol_build, "Apc.Solution", &target_names)?
+    };
 
     // Step 7 check (optional comparator_cmd)
     let comparator_err = run_comparator(
@@ -493,7 +861,11 @@ pub fn update_state_from_verdict(ctx: &Ctx, verdict: &Verdict) -> Result<()> {
 }
 
 pub fn gate_cmd(ctx: &Ctx, json: bool) -> Result<(String, u8)> {
-    let verdict = run(ctx)?;
+    gate_cmd_opts(ctx, json, false)
+}
+
+pub fn gate_cmd_opts(ctx: &Ctx, json: bool, fresh: bool) -> Result<(String, u8)> {
+    let verdict = run_with_opts(ctx, fresh)?;
     let _ = update_state_from_verdict(ctx, &verdict);
 
     let out = if json {
@@ -629,5 +1001,33 @@ mod tests {
         ctx.cfg.policy.comparator_cmd = "nonexistent-vdash-comparator-bin".to_string();
         let err2 = run_comparator(&ctx, &cb, &sb, &ct, &st, &targets).unwrap();
         assert!(err2.contains("comparator failed to run"), "got: {err2}");
+    }
+
+    #[test]
+    fn input_digest_ignores_unimported_work_file_and_detects_closure_and_policy_changes() {
+        let tmp = TempDir::new().unwrap();
+        let (mut ctx, _, _, _, _, _) = mk_gate_ctx(&tmp);
+        fs::create_dir_all(ctx.campaign.proof_work_dir()).unwrap();
+        let sol = ctx.campaign.solution_file();
+        fs::write(&sol, "import Apc.Spec.Defs\n").unwrap();
+        let d0 = input_digest(&ctx).unwrap();
+
+        // Editing an unimported Proof/Work file does not change Apc.Solution's closure digest.
+        let scratch = ctx.campaign.proof_work_dir().join("Scratch.lean");
+        fs::write(&scratch, "def helper : Nat := 1\n").unwrap();
+        assert_eq!(input_digest(&ctx).unwrap(), d0);
+
+        // Importing it changes the digest, and editing it afterwards also changes the digest.
+        fs::write(&sol, "import Apc.Spec.Defs\nimport Apc.Proof.Work.Scratch\n").unwrap();
+        let d1 = input_digest(&ctx).unwrap();
+        assert_ne!(d1, d0);
+        fs::write(&scratch, "def helper : Nat := 2\n").unwrap();
+        let d2 = input_digest(&ctx).unwrap();
+        assert_ne!(d2, d1);
+
+        // Changing policy changes the digest.
+        ctx.cfg.policy.kernel_recheck = false;
+        let d3 = input_digest(&ctx).unwrap();
+        assert_ne!(d3, d2);
     }
 }

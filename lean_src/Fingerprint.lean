@@ -154,51 +154,64 @@ def serConstant (env : Environment) (cinfo : ConstantInfo) : Except String Strin
   | .thmInfo _ | .axiomInfo _ | .quotInfo _ => pure ()
   return String.intercalate "\n--\n" parts
 
-partial def buildClosure (env : Environment) (seed : Array Name) : Except String (List (String × Json)) := do
+abbrev ConstMemo := Std.HashMap Name (Json × Array Name)
+
+partial def buildClosureMemo (env : Environment) (seed : Array Name) (memoIn : ConstMemo) :
+    Except String (List (String × Json) × ConstMemo) := do
   let mut queue : Array Name := seed
   let mut qIdx : Nat := 0
   let mut visited : Std.HashSet Name := {}
   let mut entries : Array (String × Json) := #[]
+  let mut memo := memoIn
 
   while h : qIdx < queue.size do
     let c := queue[qIdx]'h
     qIdx := qIdx + 1
     if !visited.contains c then
       visited := visited.insert c
-      match env.find? c with
-      | none => throw s!"unknown constant {c}"
-      | some cinfo =>
-        let modName := moduleOfConst env c
-        if !modName.startsWith "Apc." then
-          let obj := Json.mkObj [
-            ("module", Json.str modName),
-            ("ext", Json.bool true),
-            ("ser", Json.null)
-          ]
-          entries := entries.push (c.toString, obj)
-        else
-          let ser ← serConstant env cinfo
-          let obj := Json.mkObj [
-            ("module", Json.str modName),
-            ("ext", Json.bool false),
-            ("ser", Json.str ser)
-          ]
-          entries := entries.push (c.toString, obj)
-          let mut nextConsts := exprConsts cinfo.type
-          match cinfo with
-          | .defnInfo v => nextConsts := exprConsts v.value nextConsts
-          | .opaqueInfo v => nextConsts := exprConsts v.value nextConsts
-          | .thmInfo _ | .axiomInfo _ | .quotInfo _ => pure ()
-          | .inductInfo v => nextConsts := nextConsts ++ v.ctors.toArray
-          | .ctorInfo v => nextConsts := nextConsts.push v.induct
-          | .recInfo v =>
-            nextConsts := nextConsts ++ v.all.toArray
-            for r in v.rules do
-              nextConsts := exprConsts r.rhs nextConsts
-          queue := queue ++ nextConsts
-  return entries.toList
+      if let some (obj, nextConsts) := memo[c]? then
+        entries := entries.push (c.toString, obj)
+        for nc in nextConsts do
+          queue := queue.push nc
+      else
+        match env.find? c with
+        | none => throw s!"unknown constant {c}"
+        | some cinfo =>
+          let modName := moduleOfConst env c
+          if !modName.startsWith "Apc." then
+            let obj := Json.mkObj [
+              ("module", Json.str modName),
+              ("ext", Json.bool true),
+              ("ser", Json.null)
+            ]
+            memo := memo.insert c (obj, #[])
+            entries := entries.push (c.toString, obj)
+          else
+            let ser ← serConstant env cinfo
+            let obj := Json.mkObj [
+              ("module", Json.str modName),
+              ("ext", Json.bool false),
+              ("ser", Json.str ser)
+            ]
+            let mut nextConsts := exprConsts cinfo.type
+            match cinfo with
+            | .defnInfo v => nextConsts := exprConsts v.value nextConsts
+            | .opaqueInfo v => nextConsts := exprConsts v.value nextConsts
+            | .thmInfo _ | .axiomInfo _ | .quotInfo _ => pure ()
+            | .inductInfo v => nextConsts := nextConsts ++ v.ctors.toArray
+            | .ctorInfo v => nextConsts := nextConsts.push v.induct
+            | .recInfo v =>
+              nextConsts := nextConsts ++ v.all.toArray
+              for r in v.rules do
+                nextConsts := exprConsts r.rhs nextConsts
+            memo := memo.insert c (obj, nextConsts)
+            entries := entries.push (c.toString, obj)
+            for nc in nextConsts do
+              queue := queue.push nc
+  return (entries.toList, memo)
 
-def fingerprintOne (env : Environment) (n : Name) : MetaM (String × Json) := do
+def fingerprintOneMemo (env : Environment) (n : Name) (memo : ConstMemo) :
+    MetaM ((String × Json) × ConstMemo) := do
   match env.find? n with
   | none => throwError s!"missing constant {n}"
   | some cinfo =>
@@ -207,8 +220,8 @@ def fingerprintOne (env : Environment) (n : Name) : MetaM (String × Json) := do
     let tySer ← match serTargetType cinfo with
       | .ok s => pure s
       | .error msg => throwError msg
-    let closEntries ← match buildClosure env (exprConsts cinfo.type) with
-      | .ok es => pure es
+    let (closEntries, memo') ← match buildClosureMemo env (exprConsts cinfo.type) memo with
+      | .ok res => pure res
       | .error msg => throwError msg
     let axs ← Lean.collectAxioms n
     let axStrs := (axs.map toString).qsort (· < ·)
@@ -219,7 +232,7 @@ def fingerprintOne (env : Environment) (n : Name) : MetaM (String × Json) := do
       ("axioms", Json.arr (axStrs.map Json.str)),
       ("closure", Json.mkObj closEntries)
     ]
-    return (n.toString, obj)
+    return ((n.toString, obj), memo')
 
 def findChallengeTargets (env : Environment) : Array Name := Id.run do
   let targetMod : Name := (`Apc).str "Challenge"
@@ -238,23 +251,27 @@ def main (mode : String) (names : List String) : MetaM Unit := do
   let env ← getEnv
   if mode == "targets" then
     let tnames := findChallengeTargets env
-    let mut pairs : List (String × Json) := []
+    let mut pairs : Array (String × Json) := #[]
+    let mut memo : ConstMemo := {}
     for n in tnames do
-      let p ← fingerprintOne env n
-      pairs := pairs ++ [p]
-    let j := Json.mkObj pairs
+      let (p, memo') ← fingerprintOneMemo env n memo
+      memo := memo'
+      pairs := pairs.push p
+    let j := Json.mkObj pairs.toList
     IO.println s!"APCFP {j.compress}"
   else if mode == "closure" then
-    let mut pairs : List (String × Json) := []
+    let mut pairs : Array (String × Json) := #[]
+    let mut memo : ConstMemo := {}
     for s in names do
       let n := s.toName
       if (env.find? n).isSome then
-        let p ← fingerprintOne env n
-        pairs := pairs ++ [p]
-    let j := Json.mkObj pairs
+        let (p, memo') ← fingerprintOneMemo env n memo
+        memo := memo'
+        pairs := pairs.push p
+    let j := Json.mkObj pairs.toList
     IO.println s!"APCFP {j.compress}"
   else if mode == "axioms" then
-    let mut pairs : List (String × Json) := []
+    let mut pairs : Array (String × Json) := #[]
     for s in names do
       let n := s.toName
       match env.find? n with
@@ -265,7 +282,7 @@ def main (mode : String) (names : List String) : MetaM Unit := do
           ("axioms", Json.arr #[]),
           ("statement", Json.null)
         ]
-        pairs := pairs ++ [(s, obj)]
+        pairs := pairs.push (s, obj)
       | some cinfo =>
         let k := kindOfConst cinfo
         let axs ← Lean.collectAxioms n
@@ -278,8 +295,8 @@ def main (mode : String) (names : List String) : MetaM Unit := do
           ("axioms", Json.arr (axStrs.map Json.str)),
           ("statement", Json.str stmt)
         ]
-        pairs := pairs ++ [(s, obj)]
-    let j := Json.mkObj pairs
+        pairs := pairs.push (s, obj)
+    let j := Json.mkObj pairs.toList
     IO.println s!"APCFP {j.compress}"
   else
     throwError s!"unknown mode {mode}"

@@ -140,6 +140,80 @@ fn import_graph_text(eng: &Engine, plan: &Plan) -> String {
     lean::imports::format_import_graph(&scan, &tags)
 }
 
+/// Top-level declaration names in Lean source: `theorem`, `lemma`, `def`, ... after
+/// any attributes and modifiers, with `namespace` blocks applied.
+pub fn declared_names(src: &str) -> Vec<String> {
+    const KW: [&str; 9] = ["theorem", "lemma", "def", "abbrev", "structure", "inductive", "class", "instance", "opaque"];
+    const MODS: [&str; 6] = ["private", "protected", "noncomputable", "partial", "unsafe", "nonrec"];
+    let mut ns: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let mut t = line.trim_start();
+        if line.len() != t.len() {
+            continue; // indented: not top level
+        }
+        if let Some(n) = t.strip_prefix("namespace ") {
+            ns.push(n.trim().to_string());
+            continue;
+        }
+        if t.starts_with("end") && ns.last().is_some_and(|n| t[3..].trim() == n) {
+            ns.pop();
+            continue;
+        }
+        while t.starts_with("@[") {
+            match t.find(']') {
+                Some(i) => t = t[i + 1..].trim_start(),
+                None => break,
+            }
+        }
+        while let Some(m) = MODS.iter().find(|m| t.starts_with(*m) && t[m.len()..].starts_with(' ')) {
+            t = t[m.len()..].trim_start();
+        }
+        let Some(kw) = KW.iter().find(|k| t.starts_with(*k) && t[k.len()..].starts_with(' ')) else { continue };
+        let name: String = t[kw.len()..].trim_start().chars().take_while(|c| !c.is_whitespace() && !"({[:".contains(*c)).collect();
+        if name.is_empty() {
+            continue;
+        }
+        let full = if ns.is_empty() || name.starts_with("_root_.") { name.trim_start_matches("_root_.").to_string() } else { format!("{}.{name}", ns.join(".")) };
+        out.push(format!("{kw} {full}"));
+    }
+    out
+}
+
+/// The proof library at a glance for the integrator: every `Apc.Proof.*` module
+/// and `Apc.Solution`, with its line count, `Apc.*` imports and declarations, so it
+/// reads only the files it changes instead of exploring the tree.
+fn library_map(ctx: &Ctx) -> String {
+    let tree = ctx.campaign.lean_dir();
+    let Ok(scan) = lean::imports::scan_imports(&tree) else { return String::new() };
+    // agy takes at most 100 KB of prompt (fact A3); past this budget a file is
+    // listed by path and size only.
+    const BUDGET: usize = 24_000;
+    let mut out = String::new();
+    for (m, deps) in &scan.graph {
+        if !(m.starts_with("Apc.Proof.") || m == "Apc.Solution") {
+            continue;
+        }
+        let Some(rel) = scan.rel_paths.get(m) else { continue };
+        let src = fs::read_to_string(tree.join(rel)).unwrap_or_default();
+        if out.len() > BUDGET {
+            out.push_str(&format!("lean/{} ({} lines)\n", rel.display(), src.lines().count()));
+            continue;
+        }
+        let decls = declared_names(&src);
+        let shown: Vec<&str> = decls.iter().take(25).map(String::as_str).collect();
+        out.push_str(&format!(
+            "lean/{} ({} lines)\n  imports: {}\n  declares: {}{}\n",
+            rel.display(),
+            src.lines().count(),
+            if deps.is_empty() { "-".to_string() } else { deps.join(", ") },
+            if shown.is_empty() { "-".to_string() } else { shown.join("; ") },
+            if decls.len() > shown.len() { format!("; ... ({} more)", decls.len() - shown.len()) } else { String::new() },
+        ));
+    }
+    out
+}
+
 /// Goals the solution still needs: every goal whose file `Apc.Solution` imports,
 /// every unfinished goal whose `parent_target` is unaccepted, and every goal those
 /// and the unaccepted targets reach through `depends_on`. The walk stops at
@@ -376,25 +450,62 @@ fn record_module_times(ctx: &Ctx, rep: &lean::build::BuildReport) {
     });
 }
 
-/// Build one module of the work tree and check its declarations (M3-05).
-pub fn check_decls(ctx: &Ctx, file: &str, names: &[String]) -> std::result::Result<BTreeMap<String, fingerprint::DeclInfo>, String> {
+/// Axiom-check results by (campaign, module build key, names). The build key
+/// covers the module's source, its imports' keys, the toolchain and LEAN_PATH, so
+/// an equal key means the same compiled module and the same answer. It saves a
+/// Lean run (which loads every import, Mathlib included) when the same claim is
+/// checked twice, e.g. when a worker's reply is promoted and then verified.
+static DECL_MEMO: Mutex<BTreeMap<String, BTreeMap<String, fingerprint::DeclInfo>>> = Mutex::new(BTreeMap::new());
+
+/// Build `file`'s module in the work tree and check it builds, with no sorry
+/// unless it is `Solution.lean` checked for named theorems. Returns the module and
+/// its build key.
+fn build_checked(ctx: &Ctx, file: &str, named: bool) -> std::result::Result<(String, Option<String>), String> {
     let module = ctx.campaign.module_name(file).map_err(|e| e.message)?;
     let tree = ctx.campaign.lean_dir();
     let build_dir = ctx.campaign.build_work_dir();
-    let rep = lean::build::build(ctx, &tree, &build_dir, Some(std::slice::from_ref(&module))).map_err(|e| e.message)?;
+    let (rep, keys) = lean::build::build_with_keys(ctx, &tree, &build_dir, Some(std::slice::from_ref(&module))).map_err(|e| e.message)?;
     record_module_times(ctx, &rep);
     if !rep.ok {
         return Err(format!("{file} does not build"));
     }
-    if (file != "lean/Apc/Solution.lean" || names.is_empty())
+    if (file != "lean/Apc/Solution.lean" || !named)
         && rep.results.get(&module).is_some_and(|r| r.diagnostics.iter().any(|d| d.kind == "hasSorry"))
     {
         return Err(format!("{file} still contains sorry"));
     }
+    let key = keys.get(&module).cloned();
+    Ok((module, key))
+}
+
+/// Build one module of the work tree and check its declarations (M3-05).
+pub fn check_decls(ctx: &Ctx, file: &str, names: &[String]) -> std::result::Result<BTreeMap<String, fingerprint::DeclInfo>, String> {
+    let (module, key) = build_checked(ctx, file, !names.is_empty())?;
     if names.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let info = fingerprint::axioms(ctx, &tree, &build_dir, &module, names).map_err(|e| e.message)?;
+    let memo_key = key.map(|k| format!("{}\0{k}\0{}", ctx.campaign.root.display(), names.join("\0")));
+    let cached = memo_key.as_ref().and_then(|k| DECL_MEMO.lock().unwrap().get(k).cloned());
+    let info = match cached {
+        Some(i) => i,
+        None => {
+            let i = fingerprint::axioms(ctx, &ctx.campaign.lean_dir(), &ctx.campaign.build_work_dir(), &module, names).map_err(|e| e.message)?;
+            if let Some(k) = memo_key {
+                let mut m = DECL_MEMO.lock().unwrap();
+                if m.len() >= 512 {
+                    m.clear();
+                }
+                m.insert(k, i.clone());
+            }
+            i
+        }
+    };
+    decls_are_theorems(file, names, &info)?;
+    Ok(info)
+}
+
+/// Every name is a theorem in `file` that uses only the standard axioms.
+fn decls_are_theorems(file: &str, names: &[String], info: &BTreeMap<String, fingerprint::DeclInfo>) -> std::result::Result<(), String> {
     for n in names {
         match info.get(n) {
             Some(d) if d.exists && d.kind == "theorem" => {
@@ -406,7 +517,7 @@ pub fn check_decls(ctx: &Ctx, file: &str, names: &[String]) -> std::result::Resu
             _ => return Err(format!("{n} does not exist in {file}")),
         }
     }
-    Ok(info)
+    Ok(())
 }
 
 /// Check a worker's `proved` claim: the file builds without sorry, every claimed
@@ -420,12 +531,31 @@ pub fn verify_claim(ctx: &Ctx, file: &str, names: &[String], defs: &[(String, St
     if names.is_empty() {
         return Err("no lemma names were given".into());
     }
-    check_decls(ctx, file, &all)?;
-    if !defs.is_empty() {
-        let module = ctx.campaign.module_name(file).map_err(|e| e.message)?;
-        let ws: Vec<String> = defs.iter().map(|(_, w)| w.clone()).collect();
-        let fps = fingerprint::closure(ctx, &ctx.campaign.lean_dir(), &ctx.campaign.build_work_dir(), &module, &ws)
-            .map_err(|e| e.message)?;
+    if defs.is_empty() {
+        check_decls(ctx, file, &all)?;
+        return Ok(());
+    }
+    // Witnesses: one `closure` run gives kind and axioms for every name as well as
+    // the witnesses' closures, instead of an `axioms` run followed by a `closure` run.
+    let (module, _) = build_checked(ctx, file, true)?;
+    let (tree, build_dir) = (ctx.campaign.lean_dir(), ctx.campaign.build_work_dir());
+    let fps = match fingerprint::closure(ctx, &tree, &build_dir, &module, &all) {
+        Ok(fps) => {
+            let info: BTreeMap<String, fingerprint::DeclInfo> = fps
+                .iter()
+                .map(|(n, f)| (n.clone(), fingerprint::DeclInfo { exists: true, kind: f.kind.clone(), axioms: f.axioms.clone(), statement: None }))
+                .collect();
+            decls_are_theorems(file, &all, &info)?;
+            fps
+        }
+        // Fall back to the two separate runs if the closure run itself failed.
+        Err(_) => {
+            check_decls(ctx, file, &all)?;
+            let ws: Vec<String> = defs.iter().map(|(_, w)| w.clone()).collect();
+            fingerprint::closure(ctx, &tree, &build_dir, &module, &ws).map_err(|e| e.message)?
+        }
+    };
+    {
         for (d, w) in defs {
             let mentions = fps.get(w).is_some_and(|f| f.closure.contains_key(d));
             if !mentions {
@@ -469,13 +599,51 @@ pub fn run_worker_checked<'a>(
     require_no_sorry: bool,
     build: impl Fn(Option<&str>) -> Request<'a>,
 ) -> Result<(String, Outcome)> {
+    run_worker_checked_with(eng, round, file, require_no_sorry, None, build)
+}
+
+/// The message that continues a worker's own session after the engine's check.
+fn followup_message(file: &str, diag: &str, clean: bool) -> String {
+    if clean {
+        format!("<engine_check>\n{diag}\n</engine_check>\nReply again with one JSON object matching the schema.\n")
+    } else {
+        format!(
+            "<diagnostics>\n{diag}\n</diagnostics>\nThe engine ran `vdash check {file}` after your reply and the file does not compile cleanly yet. Fix the errors above, editing only {file}, then reply again with one JSON object matching the schema.\n"
+        )
+    }
+}
+
+/// [`run_worker_checked`]. With `promote = Some(names)`, a reply that is not
+/// `proved` while the engine's own check passes (the file builds, no sorry, and
+/// `names`, or the reply's own `lean_names`, are theorems with standard axioms) is
+/// recorded as `proved` without another agent call: the engine's check is what
+/// counts, and the verify stage re-checks the claim anyway. Follow-up calls
+/// resume the worker's session, so the worker keeps its context.
+pub fn run_worker_checked_with<'a>(
+    eng: &Engine,
+    round: u32,
+    file: &str,
+    require_no_sorry: bool,
+    promote: Option<&[String]>,
+    build: impl Fn(Option<&str>) -> Request<'a>,
+) -> Result<(String, Outcome)> {
     let mut diag: Option<String> = None;
+    let mut clean_followup = false;
+    let mut session: Option<crate::backend::Session> = None;
     let mut last = (String::new(), Outcome::Failed("not run".into()));
     for attempt in 0..=WORKER_RETRIES {
         if eng.stopping() {
             break;
         }
-        let (id, out) = agents::run(&eng.ctx, eng.pool, round, build(diag.as_deref()))?;
+        let mut req = build(diag.as_deref());
+        if let Some(d) = diag.as_deref() {
+            req = req.resume(session.clone(), followup_message(file, d, clean_followup));
+        }
+        let ran = agents::run_full(&eng.ctx, eng.pool, round, req)?;
+        let (id, out) = (ran.id, ran.outcome);
+        if ran.session.is_some() {
+            session = ran.session;
+        }
         let sandbox_blocked = out.ok().is_some_and(|v| {
             let notes = v["notes"].as_str().unwrap_or("").to_lowercase();
             notes.contains("vdash")
@@ -507,10 +675,11 @@ pub fn run_worker_checked<'a>(
             Ok(()) => Ok(()),
             Err(report) => {
                 let last_line = report.trim_end().lines().last().unwrap_or("");
+                let names: &[String] = if claimed_names.is_empty() { promote.unwrap_or(&[]) } else { &claimed_names };
                 if !require_no_sorry
                     && last_line.starts_with("OK (")
-                    && !claimed_names.is_empty()
-                    && check_decls(&eng.ctx, file, &claimed_names).is_ok()
+                    && !names.is_empty()
+                    && check_decls(&eng.ctx, file, names).is_ok()
                 {
                     Ok(())
                 } else {
@@ -520,11 +689,32 @@ pub fn run_worker_checked<'a>(
         };
         match check_res {
             Ok(()) => {
-                if is_proved || attempt >= WORKER_RETRIES {
+                if is_proved {
+                    break;
+                }
+                if let (Some(expected), Outcome::Ok(v)) = (promote, &last.1) {
+                    let names: Vec<String> = if claimed_names.is_empty() { expected.to_vec() } else { claimed_names.clone() };
+                    let mut names = names;
+                    for n in expected {
+                        if !names.contains(n) {
+                            names.push(n.clone());
+                        }
+                    }
+                    if names.is_empty() || check_decls(&eng.ctx, file, &names).is_ok() {
+                        let mut v = v.clone();
+                        v["status"] = json!("proved");
+                        v["lean_names"] = json!(names);
+                        events::emit(&eng.ctx, round, "note", json!({"text": format!("{file} checks cleanly; the engine records {} as proved without asking the worker again", if names.is_empty() { file.to_string() } else { names.join(", ") })}));
+                        last.1 = Outcome::Ok(v);
+                        break;
+                    }
+                }
+                if attempt >= WORKER_RETRIES {
                     break;
                 }
                 // File compiled cleanly, but the worker reported stuck/partial (e.g. missing `vdash` in sandbox).
                 events::emit(&eng.ctx, round, "note", json!({"text": format!("{file} compiled cleanly; asking worker to confirm proved status")}));
+                clean_followup = true;
                 diag = Some("The engine checked your file and it compiled cleanly (OK). Do not mark stuck/partial due to missing vdash in the sandbox: if your proof is complete and matches the goal statement, reply with status \"proved\" and the theorem name(s) in lean_names.".into());
             }
             Err(report) => {
@@ -539,6 +729,7 @@ pub fn run_worker_checked<'a>(
                 if attempt < WORKER_RETRIES {
                     events::emit(&eng.ctx, round, "note", json!({"text": format!("{file} does not check yet; sending the errors back to the worker")}));
                 }
+                clean_followup = false;
                 diag = Some(report);
             }
         }
@@ -951,7 +1142,14 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
                             .section("bulletin", bulletin_tail(&eng.ctx))
                             .label(a.goal.clone())
                     };
-                    match run_worker_checked(eng, round, &a.file, false, build) {
+                    // Witness goals also need `new_definitions` from the worker, so
+                    // only lemma, target and repair goals are promoted by the engine.
+                    let promote: Option<Vec<String>> = match g.kind.as_str() {
+                        "repair" => Some(Vec::new()),
+                        "witness" => None,
+                        _ => Some(vec![g.lean_name.clone()]),
+                    };
+                    match run_worker_checked_with(eng, round, &a.file, false, promote.as_deref(), build) {
                         Ok((agent, Outcome::Ok(v))) => json!({"agent": agent, "goal_id": a.goal, "file": a.file, "reply": v}),
                         Ok((agent, Outcome::Failed(f))) => json!({"agent": agent, "goal_id": a.goal, "file": a.file, "failed": f}),
                         Err(e) => json!({"goal_id": a.goal, "file": a.file, "failed": e.message}),
@@ -1183,6 +1381,7 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
     slow.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
     let req = Request::new(Role::Integrator, Reply::Integrator, "Move the verified lemmas below into lean/Apc/Proof/Lib/, remove duplicates, and keep every file building.")
         .section("verified_lemmas", work.iter().map(|g| format!("{} in {}: {}", g.lean_name, g.file, g.statement)).collect::<Vec<_>>().join("\n"))
+        .section("library_map", library_map(&eng.ctx))
         .section("slow_modules", slow.iter().take(5).map(|(m, t)| format!("{m}: {t:.1}s")).collect::<Vec<_>>().join("\n"))
         .section("solution_check", format!("`vdash check lean/Apc/Solution.lean`, run by the engine just now:\n{solution_check}"))
         .label("integrate");
@@ -1206,10 +1405,19 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
             .flatten()
             .filter_map(|m| Some((m["lean_name"].as_str()?.to_string(), m["to"].as_str()?.to_string())))
             .collect();
+        // One check per file (one Lean run each); per-lemma only to name the lost ones.
+        let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for g in &work {
             let file = moved.get(&g.lean_name).cloned().unwrap_or_else(|| g.file.clone());
-            if check_decls(&eng.ctx, &file, std::slice::from_ref(&g.lean_name)).is_err() {
-                lost.push(g.lean_name.clone());
+            by_file.entry(file).or_default().push(g.lean_name.clone());
+        }
+        for (file, names) in &by_file {
+            if check_decls(&eng.ctx, file, names).is_err() {
+                for n in names {
+                    if check_decls(&eng.ctx, file, std::slice::from_ref(n)).is_err() {
+                        lost.push(n.clone());
+                    }
+                }
             }
         }
         if (after_ok || !before_ok) && lost.is_empty() {
@@ -1308,6 +1516,15 @@ mod tests {
     use super::*;
     use crate::config::BackendKind;
     use crate::lean::build::{BuildReport, ModuleResult};
+
+    #[test]
+    fn declared_names_follow_namespaces_attributes_and_modifiers() {
+        let src = "import Mathlib\nnamespace Apc\n@[simp] theorem a : 1 = 1 := rfl\nprivate noncomputable def b (n : Nat) : Nat := n\n  theorem nested : True := trivial\nnamespace Inner\nlemma c: True := trivial\nend Inner\ntheorem _root_.top : True := trivial\nend Apc\ninstance foo : Inhabited Nat := ⟨0⟩\n";
+        assert_eq!(
+            declared_names(src),
+            vec!["theorem Apc.a", "def Apc.b", "lemma Apc.Inner.c", "theorem top", "instance foo"]
+        );
+    }
     use crate::paths;
     use tempfile::TempDir;
 

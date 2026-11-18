@@ -238,13 +238,55 @@ pub fn enforce(ctx: &Ctx, snap: &Snapshot, scope: Scope, allowed: &BTreeSet<Stri
     Ok(v)
 }
 
+fn scan_trusted(ctx: &Ctx) -> BTreeMap<String, Entry> {
+    let mut m = BTreeMap::new();
+    let root = &ctx.campaign.root;
+
+    let chal_rel = "lean/Apc/Challenge.lean";
+    if let Some(en) = read_entry(&root.join(chal_rel)) {
+        m.insert(chal_rel.to_string(), en);
+    }
+
+    for dir_rel in ["lean/Apc/Spec", ".heldout"] {
+        let dir = root.join(dir_rel);
+        let Ok(md) = fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if md.is_dir() {
+            for e in WalkDir::new(&dir).follow_links(false).into_iter().flatten() {
+                if e.file_type().is_dir() {
+                    continue;
+                }
+                let Ok(rel) = e.path().strip_prefix(root) else { continue };
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                if let Some(en) = read_entry(e.path()) {
+                    m.insert(rel_s, en);
+                }
+            }
+        } else if let Some(en) = read_entry(&dir) {
+            m.insert(dir_rel.to_string(), en);
+        }
+    }
+
+    let anchor = ctx.state_dir.join("anchor.json");
+    if let Some(en) = read_entry(&anchor) {
+        m.insert(format!("{STATE_PREFIX}anchor.json"), en);
+    }
+    m
+}
+
 /// Restore only the trusted spec files (and the held-out copy) to their snapshot
 /// state, leaving every other change alone. Used mid-round, before the engine
 /// checks a worker's file, so the check runs against the real spec.
 pub fn restore_trusted(ctx: &Ctx, snap: &Snapshot) -> Result<Vec<Violation>> {
-    let now = scan(ctx);
+    let now = scan_trusted(ctx);
     let trusted = |k: &str| {
-        k == "lean/Apc/Challenge.lean" || k.starts_with("lean/Apc/Spec/") || k.starts_with(".heldout/") || k.starts_with(STATE_PREFIX)
+        k == "lean/Apc/Challenge.lean"
+            || k == "lean/Apc/Spec"
+            || k.starts_with("lean/Apc/Spec/")
+            || k == ".heldout"
+            || k.starts_with(".heldout/")
+            || k.starts_with(STATE_PREFIX)
     };
     let mut v = Vec::new();
     for (k, cur) in &now {
@@ -420,5 +462,20 @@ mod tests {
         enforce(&ctx, &snap, Scope::Proof, &BTreeSet::new()).unwrap();
         assert_eq!(fs::read_to_string(&held).unwrap(), "orig");
         assert_eq!(fs::metadata(&held).unwrap().permissions().mode() & 0o777, 0o444);
+    }
+
+    #[test]
+    fn restore_trusted_restores_trusted_only_without_touching_proofs() {
+        let (_t, ctx) = setup();
+        let r = &ctx.campaign.root;
+        let snap = snapshot(&ctx);
+        fs::write(r.join("lean/Apc/Spec/Defs.lean"), "-- hacked\n").unwrap();
+        fs::write(r.join("lean/Apc/Spec/Extra.lean"), "-- injected\n").unwrap();
+        fs::write(r.join("lean/Apc/Solution.lean"), "-- worker proof\n").unwrap();
+        let v = restore_trusted(&ctx, &snap).unwrap();
+        assert!(fs::read_to_string(r.join("lean/Apc/Spec/Defs.lean")).unwrap().contains("Sorted"));
+        assert!(!r.join("lean/Apc/Spec/Extra.lean").exists());
+        assert_eq!(fs::read_to_string(r.join("lean/Apc/Solution.lean")).unwrap(), "-- worker proof\n");
+        assert_eq!(v.len(), 2);
     }
 }

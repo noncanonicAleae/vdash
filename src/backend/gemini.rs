@@ -25,7 +25,16 @@ impl AgyCli {
         AgyCli { command }
     }
 
+    /// The resumed session id, when this call continues an agy conversation.
+    fn resumed(call: &AgentCall) -> Option<&str> {
+        call.resume.as_ref().filter(|r| r.session.backend == BackendKind::Gemini).map(|r| r.session.id.as_str())
+    }
+
     pub fn full_prompt(call: &AgentCall) -> String {
+        // A resumed conversation already holds the skill; send only the new message.
+        if Self::resumed(call).is_some() {
+            return format!("{}\n\nYour reply must be a single JSON object matching the schema you were given.", call.prompt.trim_end());
+        }
         format!(
             "{}\n\n---\n\nYour reply must be a single JSON object matching the schema you were given.\n\n{}",
             call.skill.trim_end(),
@@ -58,6 +67,11 @@ impl AgyCli {
         a.push("--json-schema".into());
         a.push(call.schema.to_string());
         a.push("--disable-slash-commands".into());
+        if let Some(id) = Self::resumed(call) {
+            // Fact A18: `--conversation <id>` continues it (prompt cache hits).
+            a.push("--conversation".into());
+            a.push(id.to_string());
+        }
         if Self::sandboxed(call) {
             // Fact A15: in print mode agy's built-in tool-safety monitor soft-denies
             // every shell command (`--settings` allow rules do not help) and the turn
@@ -89,6 +103,7 @@ pub fn parse(stdout: &str) -> AgentResult {
             return r;
         }
     };
+    r.session = v.get("conversation_id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         // `error` is an object `{message, code}` for startup failures and a plain
         // string for failures mid-turn (e.g. "The stream was interrupted ...").
@@ -189,6 +204,10 @@ impl Backend for AgyCli {
         };
         r.backend = Some(BackendKind::Gemini);
         r.model = call.model.clone();
+        r.resumed = Self::resumed(call).is_some();
+        if r.failure == Some(Failure::Quota) {
+            r.retry_after = super::quota_reset(&format!("{}\n{}", r.text, r.raw));
+        }
         r.seconds = start.elapsed().as_secs_f64();
         r.argv = shown;
         r
@@ -237,7 +256,27 @@ mod tests {
             profile,
             model: None,
             timeout: std::time::Duration::from_secs(60),
+            resume: None,
         }
+    }
+
+    #[test]
+    fn conversation_id_is_parsed_and_resume_sends_only_the_new_message() {
+        use crate::backend::{Resume, Session};
+        use crate::config::Role;
+        let s = r#"{"conversation_id":"c7bf","status":"SUCCESS","response":"{}","structured_output":{}}"#;
+        assert_eq!(parse(s).session.as_deref(), Some("c7bf"));
+        let mut c = call(Role::Worker, Profile::Lean);
+        c.skill = "SKILL TEXT".into();
+        c.prompt = "fix it".into();
+        assert!(AgyCli::full_prompt(&c).contains("SKILL TEXT"));
+        c.resume = Some(Resume { session: Session { backend: BackendKind::Gemini, id: "c7bf".into() }, prompt: "fix it".into() });
+        let text = AgyCli::full_prompt(&c);
+        assert!(!text.contains("SKILL TEXT") && text.starts_with("fix it"), "{text}");
+        let a = AgyCli::args(&c, &text).join(" ");
+        assert!(a.contains("--conversation c7bf"), "{a}");
+        c.resume.as_mut().unwrap().session.backend = BackendKind::Claude;
+        assert!(!AgyCli::args(&c, "x").join(" ").contains("--conversation"));
     }
 
     #[test]

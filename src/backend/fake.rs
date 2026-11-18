@@ -16,6 +16,8 @@ pub enum Step {
     Reply(Value),
     Func(StepFn),
     Fail(Failure),
+    /// A usage limit that the CLI says resets after this long.
+    QuotaFor(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,8 @@ pub struct Call {
     pub role: Role,
     pub prompt: String,
     pub model: Option<String>,
+    /// The session id this call resumed, if any.
+    pub resumed: Option<String>,
 }
 
 pub struct FakeBackend {
@@ -87,7 +91,9 @@ impl Backend for FakeBackend {
             role: call.role,
             prompt: call.prompt.clone(),
             model: call.model.clone(),
+            resumed: call.resume.as_ref().filter(|r| r.session.backend == self.kind).map(|r| r.session.id.clone()),
         });
+        let n = self.calls.lock().unwrap().len();
         if !self.delay.is_zero() {
             std::thread::sleep(self.delay);
         }
@@ -98,6 +104,8 @@ impl Backend for FakeBackend {
             argv: vec![format!("fake-{}", self.kind)],
             seconds: self.delay.as_secs_f64(),
             cost_usd: Some(0.0),
+            session: Some(format!("fake-{}-{n}", self.kind)),
+            resumed: call.resume.as_ref().is_some_and(|r| r.session.backend == self.kind),
             ..Default::default()
         };
         let value = match step {
@@ -105,6 +113,11 @@ impl Backend for FakeBackend {
             Some(Step::Func(f)) => f(call),
             Some(Step::Fail(f)) => {
                 r.failure = Some(f);
+                return r;
+            }
+            Some(Step::QuotaFor(d)) => {
+                r.failure = Some(Failure::Quota);
+                r.retry_after = Some(d);
                 return r;
             }
             None => match self.fallback.lock().unwrap().get(&call.role) {

@@ -52,8 +52,15 @@ failure classification are in `ROADMAP.md` (§1 facts, cards M2-02 and M2-03).
   no system-prompt flag and takes the prompt as an argument, not on stdin, so prompts
   are size-capped. Each backend's command is configurable.
 - Both: API-key variables are stripped from the child environment
-  (`use_subscription = true`); sessions are never resumed; user settings, MCP servers
-  and extensions are switched off for agents as far as each CLI allows.
+  (`use_subscription = true`); user settings, MCP servers and extensions are switched
+  off for agents as far as each CLI allows.
+- **Follow-ups resume the session** (user request 2026-11-18, facts C16/A18). A
+  follow-up to a call (a schema repair, a worker fixing the engine's check errors)
+  continues that call's session (`claude --resume <id>`, `agy --conversation <id>`)
+  and sends only the new message, so the model keeps its context and the prompt cache
+  hits instead of re-reading every file. The pool runs a follow-up on the session's
+  backend when it has a free slot; otherwise the call runs fresh with the full prompt
+  on whichever backend serves it. Every first call still starts a new session.
 
 **Role assignment.** `[roles]` in `campaign.toml` maps each role to one or more
 `backend[:model]` entries. Defaults when both CLIs are logged in:
@@ -70,8 +77,14 @@ entries is served by whichever listed backend has a free slot. The user changes 
 of this in the file or live with `/model`.
 
 **Scheduling.** Each backend has its own concurrency cap (`max_concurrent`) and its
-own quota state. When one backend reports a usage limit it is paused with exponential
-backoff while the other keeps working; calls for multi-backend roles flow to the
+own quota state. When one backend reports a usage limit it is paused while the other
+keeps working: until the reset time the CLI reports (`backend::quota_reset`, plus 20
+s), or else with exponential backoff, one step per pause (calls already in flight
+that hit the same limit do not double it again). When the pause ends the backend
+gets one call (the probe) until a call succeeds, so a limit that is still exhausted
+costs one failed call, not one per waiting thread. `backend_paused` events carry the
+CLI's message and whether the reset time was known; `agent_finished` reports
+`waited_s` (time queued for a slot or a paused backend) apart from `seconds`; calls for multi-backend roles flow to the
 healthy one, and calls for a role pinned to the paused backend wait (or spill over if
 `spillover = true`). If only one CLI is available, every role falls back to it with a
 warning. `vdash doctor` reports what is installed and logged in.
@@ -216,14 +229,19 @@ It sees file paths and theorem names only.
 
 0. **Anchor check**: `.heldout/` manifest hash equals the anchor's; the amendment
    chain in the anchor matches `amendments/` approvals. Otherwise fail everything.
-1. **Fresh replay**: copy `.heldout/` to a temp challenge tree; copy the work tree's
+1. **Fresh replay (with trusted `state_dir` gate cache)**: copy the work tree's
    `lean/` (including its Spec files, so tampering is detected, not masked, but
-   without `Challenge.lean`) to a temp solution tree. Build both from scratch.
+   without `Challenge.lean`) to a temp solution tree. `.heldout/` targets and
+   fingerprints, `Apc.Solution`'s gate `.olean` build, `leanchecker` markers, and
+   `Fingerprint.lean` are cached inside `$XDG_STATE_HOME/vdash/<campaign-id>/`
+   (never `.build/work`) keyed by content hashes; `vdash gate --fresh` forces a
+   from-scratch build into fresh temp dirs.
 2. **Source scan** of untrusted files, comments and strings stripped: reject kernel
    bypasses (`skipKernelTC`, `addDeclWithoutChecking`, `debug.`), compiler trust
    (`unsafe`, `implemented_by`, `extern`, `native_decide`, `ofReduceBool`), `axiom`,
    and environment manipulation (`run_cmd`, `initialize`, `modifyEnv`, ...). Then
-   `leanchecker` replays the untrusted modules through the kernel (`kernel_recheck`).
+   `leanchecker` replays modified/uncached untrusted modules through the kernel in
+   parallel across `max_parallel_lean` slots (`kernel_recheck`).
 3. **Fingerprint** (an embedded Lean script):
    - Challenge env: targets are all theorems in module `Apc.Challenge`.
    - For each target, walk its transitive constant closure: type always; values for
@@ -275,9 +293,14 @@ One round:
       new_definitions:[{name, witness}], notes, amendment?}`. **Witness rule**: each
       new invariant or hypothesis predicate must name a lemma showing it is inhabited.
       After each reply the engine restores the trusted files and runs the check
-      itself; if the file does not build cleanly it calls the worker again with the
-      diagnostics (up to two more times). Workers therefore never depend on being
-      able to run `vdash check` (Antigravity's safety monitor sometimes refuses it).
+      itself; if the file does not build cleanly it calls the worker again, resuming
+      its session with only the diagnostics (up to two more times). Workers therefore
+      never depend on being able to run `vdash check` (Antigravity's safety monitor
+      sometimes refuses it). When the file checks cleanly but the reply is not
+      `proved`, the engine checks the goal's theorem itself (`check_decls`) and
+      records the reply as `proved` without another call; step 5 re-verifies it
+      like any claim. Witness goals are not promoted (their `new_definitions` must
+      come from the worker).
    d. **Summarise** → `{summary, goal_status, notes, bulletin[], amendments[],
       escalations[]}`. Only the short summary reaches the orchestrator. The engine
       writes `notes` to `leads/<id>.md`.
@@ -286,6 +309,8 @@ One round:
 6. Every `integrate_every` rounds, or on request: the `integrator` moves verified
    lemmas from `Proof/Work/**` to `Proof/Lib/**`, removes duplicates, generalises for
    reuse, refactors the slowest modules, keeps `Solution.lean` importing the library.
+   Its prompt carries a `<library_map>` (each proof module's imports, line count and
+   declarations, at most 24 KB) so it reads only the files it changes.
    The engine re-checks the build and commits; a broken integration is reverted.
 7. Amendments and escalations (§10).
 8. `gate`. Append a paragraph to `logs/status.md`. Stop when every target is accepted

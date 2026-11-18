@@ -28,8 +28,11 @@ modules.
 - Leave `sorry` anywhere in `lean/Apc/Proof/Lib/`.
 
 ## Procedure
-1. Read the list of verified lemmas, the slowest modules and `<solution_check>`,
-   the engine's own `vdash check` of `Solution.lean` from just before your turn.
+1. Read the list of verified lemmas, the slowest modules, `<solution_check>` (the
+   engine's own `vdash check` of `Solution.lean` from just before your turn) and
+   `<library_map>` (every proof module with its imports and declarations). Plan the
+   moves from the map: open only the files you will change, and do not list or grep
+   the whole tree to find out what exists.
 2. Move verified lemmas into `lean/Apc/Proof/Lib/<Topic>.lean`, update imports so
    every file that used them still compiles, and make `Solution.lean` import the
    library modules it needs.

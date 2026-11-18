@@ -83,10 +83,16 @@ impl ClaudeCli {
             "",
             "--strict-mcp-config",
             "--disable-slash-commands",
-            "--no-session-persistence",
             "--restricted",
         ] {
             a.push(f.into());
+        }
+        // Sessions are kept so a follow-up (a worker fixing its check errors, a
+        // schema repair) continues with its context instead of re-reading every
+        // file (fact C14). The stdin prompt is then just the new message.
+        if let Some(r) = call.resume.as_ref().filter(|r| r.session.backend == BackendKind::Claude) {
+            a.push("--resume".into());
+            a.push(r.session.id.clone());
         }
         a
     }
@@ -109,6 +115,7 @@ pub fn parse(stdout: &str) -> AgentResult {
         }
     };
     r.text = v.get("result").and_then(Value::as_str).unwrap_or("").to_string();
+    r.session = v.get("session_id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
     r.structured = v.get("structured_output").filter(|s| s.is_object()).cloned();
     r.cost_usd = v.get("total_cost_usd").and_then(Value::as_f64);
     r.tokens = v
@@ -181,6 +188,10 @@ impl Backend for ClaudeCli {
         };
         r.backend = Some(BackendKind::Claude);
         r.model = call.model.clone();
+        r.resumed = call.resume.as_ref().is_some_and(|x| x.session.backend == BackendKind::Claude);
+        if r.failure == Some(Failure::Quota) {
+            r.retry_after = super::quota_reset(&format!("{}\n{}", r.text, r.raw));
+        }
         r.seconds = start.elapsed().as_secs_f64();
         r.argv = shown;
         r
@@ -225,8 +236,10 @@ mod tests {
             profile: Profile::None,
             model: Some("haiku".into()),
             timeout: std::time::Duration::from_secs(1),
+            resume: None,
         };
         let a = ClaudeCli::args(&call);
+        assert!(!a.contains(&"--resume".to_string()));
         let i = a.iter().position(|x| x == "--tools").unwrap();
         assert_eq!(a[i + 1], "");
         assert!(a.contains(&"--restricted".to_string()));
@@ -243,5 +256,31 @@ mod tests {
         assert!(a.contains(&"Bash(echo *)".to_string()));
         assert!(!a.iter().any(|r| r.starts_with("Bash(sed") || r.starts_with("Bash(find")));
         assert!(!a.contains(&"Bash(vdash check *)".to_string()) && !a.contains(&"Edit".to_string()));
+    }
+
+    #[test]
+    fn session_id_is_parsed_and_resume_only_applies_to_claude_sessions() {
+        let s = r#"{"type":"result","is_error":false,"result":"","session_id":"569bbd77-29cb","structured_output":{"a":1}}"#;
+        assert_eq!(parse(s).session.as_deref(), Some("569bbd77-29cb"));
+        let mut call = AgentCall {
+            role: crate::config::Role::Worker,
+            prompt: "p".into(),
+            skill: "s".into(),
+            schema: serde_json::json!({"type":"object"}),
+            cwd: ".".into(),
+            profile: Profile::Lean,
+            model: None,
+            timeout: std::time::Duration::from_secs(1),
+            resume: Some(crate::backend::Resume {
+                session: crate::backend::Session { backend: BackendKind::Claude, id: "abc".into() },
+                prompt: "fix it".into(),
+            }),
+        };
+        let a = ClaudeCli::args(&call);
+        let i = a.iter().position(|x| x == "--resume").unwrap();
+        assert_eq!(a[i + 1], "abc");
+        assert!(!a.contains(&"--no-session-persistence".to_string()));
+        call.resume.as_mut().unwrap().session.backend = BackendKind::Gemini;
+        assert!(!ClaudeCli::args(&call).contains(&"--resume".to_string()));
     }
 }

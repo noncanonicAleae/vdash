@@ -133,6 +133,12 @@ M4 interactive app · M5 spec phase · M6 amendments · M7 later · status log.
   `sonnet`, `haiku`, `fable` (`fable` resolved to `claude-fable-5-2`). A one-word reply
   cost about $0.0006 on Haiku, $0.009 on Sonnet, $0.019 on Opus and $0.060 on Fable.
 
+- C16. (probed 2026-11-18, `haiku`, the agents' flags with `--tools ""` and without
+  `--no-session-persistence`) The JSON result has `session_id`. `claude -p --resume
+  <id>` with the same flags and a new stdin prompt continues it: the model recalled a
+  word from the first call, the `session_id` stayed the same, and
+  `cache_read_input_tokens` was 3586. `--json-schema` applies to the resumed turn.
+
 ### Antigravity CLI (`agy` v1.5.7), the Gemini backend
 Google is moving Gemini CLI to Antigravity CLI; the user installed `agy` and is logged
 in. This is the Gemini-subscription backend. (The old `@google/gemini-cli` 0.68.0 that
@@ -215,6 +221,10 @@ was installed with bun earlier the same day is not used.)
   `grep_search` refuse paths outside the workspace. So never `--add-dir` Mathlib;
   agents search it with `grep` or `vdash search` through the shell. `search_web`
   works in every mode.
+- A18. (probed 2026-11-18) The JSON result has `conversation_id`; `agy --conversation
+  <id> -p=<new message>` continues it (recalled a word from the first call,
+  `num_turns` 2, `usage.cache_read_tokens` 10375 of 12447 input). `--json-schema`
+  applies to the resumed turn. The skill need not be resent.
 
 ### Not installed
 `node`, `comparator`, `landrun`, `lean4export`.
@@ -678,7 +688,8 @@ agent and between stages), acts, and moves each to `inbox/done/`.
   - Timeout → `ok = false`, diagnostic `timed out after <N>s`.
   - Parse stdout lines as JSON (F4); a non-JSON line becomes an `information`
     diagnostic.
-  - Concurrency: level by level, with `std::thread::scope`; the slots bound it.
+  - Concurrency: DAG work-queue scheduler inside `std::thread::scope` (spawns each
+    module as soon as its own dependencies finish); the slots bound it.
   - Tests (Lean): clean build of isort Spec; second build fully cached; touching
     `Defs.lean` rebuilds it and its dependents only; a syntax error yields
     `ok = false`, a located diagnostic, no key, and dependents marked failed;
@@ -695,8 +706,9 @@ agent and between stages), acts, and moves each to `inbox/done/`.
   - Tests (Lean): the three final-line forms; the cap on a file with 100 errors.
 
 - [x] **M1-06 `lean_src/Fingerprint.lean` + `fingerprint`**
-  - The engine writes a driver into `<build>/_apc/Driver.lean`:
-    `import Lean`, `import <root module>`, the embedded script body, then
+  - The engine precompiles `Fingerprint.lean` once per `(FINGERPRINT_LEAN, toolchain)`
+    into `<state_dir>/fp_cache/` and writes a driver into `<build>/_apc/Driver.lean`:
+    `import ApcTool.Fingerprint`, `import <root module>`, then
     `#eval ApcTool.main "<mode>" [<names>]`. It is run **without** `--json` and
     without `-o`; the script prints exactly one line `APCFP <json>` (F4, F6). No such
     line, or a non-zero exit → code 1 with Lean's output.
@@ -809,16 +821,19 @@ agent and between stages), acts, and moves each to `inbox/done/`.
   - Steps:
     0. `anchor::verify`. Any problem → every target rejected with `anchor_mismatch`,
        `anchor_ok: false`, and the CLI exits 3.
-    1. Create two fresh temp dirs, each a tree in the sense of §3.0. Challenge tree =
-       copy of `.heldout/lean/` (so it contains `Apc/`). Solution tree = copy of the
-       work tree `lean/` (so it contains `Apc/`) **without `Apc/Challenge.lean`**.
-       Build both from scratch into fresh build dirs (never reuse `.build/work`).
+    1. Copy the work tree `lean/` (without `Apc/Challenge.lean`) to a temp solution
+       tree. By default (`fresh = false`), use a gate-owned cache in `state_dir/gate_cache/`
+       (never `.build/work`) for `chal_fps` (and `chal_build` when `comparator_cmd` is
+       set; otherwise `chal_build` is scoped to `Apc.Challenge`), `sol_build` (pruning
+       stale modules outside `Apc.Solution`'s closure), `leanchecker` `.lc_ok` markers,
+       and `sol_fps`. `vdash gate --fresh` forces fresh temp build dirs from scratch.
     2. Challenge build failure is an internal fault → code 5.
        Solution: only `Apc.Solution` and its import closure are built. Failure →
        every target `build_failed`.
     3. `scan` hits → every target `forbidden_source`, hits in `detail`.
-    4. `kernel_recheck` on → `leanchecker` on each untrusted module of the closure
-       (F7), with a timeout; failure → every target `kernel_recheck_failed`.
+    4. `kernel_recheck` on → `leanchecker` in parallel across `max_parallel_lean` slots
+       on uncached untrusted modules of the closure (F7), with a timeout; failure →
+       every target `kernel_recheck_failed`.
     5. Fingerprint both (`targets` on the challenge; `closure` on the solution for
        the same names, root `Apc.Solution`).
     6. Per target, collect every applicable reason: absent in solution → `missing`;
@@ -958,9 +973,16 @@ agent and between stages), acts, and moves each to `inbox/done/`.
        only while every listed backend is paused or unavailable: a listed backend
        that is merely busy is waited for (fixed 2026-11-18; spillover used to win on
        free slots, so Gemini served roles set to Claude only).
-    3. Run. `Quota` → pause that backend for `60·2^step` s (each pause capped at
-       1800 s), emit `backend_paused`, and go back to 1 for this call. Success on a
-       backend resets its step and emits `backend_resumed` if it had been paused.
+    3. Run. `Quota` → pause that backend until the CLI's reported reset time + 20 s
+       (`AgentResult.retry_after`) or, without one, for `60·2^step` s (each pause
+       capped at 1800 s; a quota failure while the backend is already paused does
+       not add a step), emit `backend_paused` (with the CLI message and
+       `reset_known`), and go back to 1 for this call. While `step > 0` the backend
+       takes one call at a time (the probe). Success on a backend resets its step
+       and emits `backend_resumed` if it had been paused. A call with
+       `resume` prefers the session's backend when it has a free slot and sends the
+       resume message there; on any other backend it runs fresh with the full
+       prompt (2026-11-18).
     4. `Timeout` or `Crash` → one retry on the same backend, then return the failure.
        `AgentError` and `NotLoggedIn` → return at once; `NotLoggedIn` also marks the
        backend unavailable for the rest of the run and emits a `note`.
@@ -1767,3 +1789,50 @@ Gemini owns M8-03..M8-06.
   `tests/build_retry.rs`, updated `m6_02_early_rejections_and_escalation_without_lean`,
   parser and argv cases. Checked read-only against quartic-query-separation's 30
   existing escalations (all parse as open).
+- 2026-11-18 (Gemini): Gate and Lean build performance improvements (user request).
+  (1) `Engine::gate` caches the last verdict in memory keyed by `gate::input_digest`
+  (anchor, `.heldout/`, `amendments/`, `Apc.Solution`'s closure, toolchain/path, policy;
+  bypassed when `comparator_cmd` is set or `anchor::verify` fails), skipping redundant
+  `gate_pre`/`gate_post` runs across unchanged rounds while still running `anchor::verify`
+  and `record_verdict`. (2) `gate::run_with_opts` caches `chal_fps`, optional `chal_build`,
+  incremental `sol_build` (pruned to `Apc.Solution`'s closure), `leanchecker` `.lc_ok`
+  markers, and `sol_fps` under `state_dir/gate_cache/` (never `.build/work`) protected by
+  `gate.lock`; `vdash gate --fresh` forces a cold build. (3) `chal_build` scopes to
+  `Apc.Challenge` when `comparator_cmd` is empty. (4) `leanchecker` runs in parallel
+  across `max_parallel_lean` slots. (5) `lean::build::build_once` uses a DAG ready-queue
+  scheduler instead of level barriers (`build_with_keys` returns module cache keys).
+  (6) `fingerprint` precompiles `Fingerprint.lean` once per `(source, toolchain)` into
+  `state_dir/fp_cache/`. Tests: `gate::tests::input_digest_ignores_unimported_work_file_*`,
+  `dag_scheduler_runs_independent_branches_and_isolates_failures`,
+  `gate_cache_reuses_unchanged_parallel_leanchecker_and_fresh_rebuilds`,
+  `engine_in_memory_gate_cache_handles_unchanged_and_changed_rounds`; full
+  `VDASH_TEST_HOST=/home/anachronist/lean_math cargo test --offline` (155 passed) and
+  `cargo clippy --offline --all-targets -- -D warnings` clean.
+- 2026-11-18 (Claude): Agent-side performance (user request), from the event logs of
+  quartic-query-separation and sequent-calculus: 21% of quartic's worker calls only
+  asked a worker to confirm `proved`; workers used 78% of input tokens (median 89k a
+  call); the median integrator call read 932k tokens; backends sat paused 53 h, and
+  concurrent quota failures each doubled the backoff (60/120/240 s two seconds
+  apart). (1) `run_worker_checked_with`: a reply that is not `proved` while the
+  engine's check passes is promoted to `proved` after `check_decls` on the goal's
+  theorem (lemma, target and repair goals; not witness goals), without a confirm
+  call. (2) Follow-ups resume the session (facts C16, A18): `AgentCall.resume`,
+  `AgentResult.session`, `agents::run_full`/`Ran`, `Request::resume`; the schema
+  repair and the worker's diagnostic retries send only the new message. Claude no
+  longer passes `--no-session-persistence`. (3) Pool: one backoff step per pause, the
+  CLI's reset time when given (`backend::quota_reset`: epoch suffix, `retry in`/`reset
+  after` durations, `resets 3pm (Zone)` clock times via `date +%z`), one probe call
+  after a pause; `backend_paused` carries the CLI message and `reset_known`;
+  `agent_finished` and transcripts carry `waited_s` (the multi-hour "agent runs" in
+  the logs were pool waits during quota pauses). (4) Integrator prompt gets
+  `<library_map>` (`team::declared_names`), skill updated. (5) `check_decls` memoizes
+  axiom results by module build key; `integrate` checks lemmas once per file;
+  `verify_claim` with witnesses does one `closure` run instead of `axioms` +
+  `closure`. Item (a) of the board message (whole-verdict reuse) was already done by
+  Gemini's `input_digest` cache. Tests: `backend::tests::quota_reset_*`,
+  `pool::tests::{concurrent_quota_failures_pause_once_and_one_probe_runs_after,
+  cli_reset_time_sets_the_pause_instead_of_backoff,
+  resume_prefers_the_session_backend_and_sends_the_short_prompt}`, claude/gemini
+  session and resume argv cases, `agents::tests::repair_then_success_and_double_failure`
+  (repair resumes), `team::tests::declared_names_*`, `tests/worker_followup.rs` (both
+  cases need Lean); `tests/engine.rs` `solution_partial_*` now expects 2 worker calls.

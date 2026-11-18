@@ -57,6 +57,9 @@ and list in `lean_names` the theorems you kept or fixed.
 4. Run `vdash check <your file>` after every edit. Read the errors; fix them.
 5. When `vdash check` prints `OK` with no sorry, run `vdash axioms <your file> <goal name>`
    and confirm the axioms are only `propext`, `Quot.sound`, `Classical.choice`.
+6. If the engine later sends you `<diagnostics>` from its own check, it is continuing
+   this same conversation: you still have the goal and everything you read. Re-read
+   only your file, fix the errors, and reply again.
 
 ## Checks before replying
 - The last `vdash check` on your file printed exactly `OK` (or `OK (n sorry)` if editing `Solution.lean` while other targets remain `sorry`), unless `vdash` is unavailable in your sandbox (in which case the engine checks your file after your reply).

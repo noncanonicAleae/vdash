@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -58,6 +59,100 @@ fn sha256_hex(s: &str) -> String {
     hex
 }
 
+struct FileLock(fs::File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = flock(&self.0, FlockOperation::Unlock);
+    }
+}
+
+/// Compile `Fingerprint.lean` once per `(FINGERPRINT_LEAN, toolchain)` into
+/// `ctx.state_dir/fp_cache/<key>/build/ApcTool/Fingerprint.olean` so `run_driver`
+/// does not re-elaborate the 287-line script on every invocation.
+fn ensure_compiled(ctx: &Ctx) -> Result<PathBuf> {
+    let tc = lean::toolchain(&ctx.cfg)?;
+    let key = sha256_hex(&format!("v1\0{tc}\0{FINGERPRINT_LEAN}"));
+    let fp_root = ctx.state_dir.join("fp_cache").join(&key);
+    let src_dir = fp_root.join("src");
+    let build_dir = fp_root.join("build");
+    let src_path = src_dir.join("ApcTool/Fingerprint.lean");
+    let olean_path = build_dir.join("ApcTool/Fingerprint.olean");
+    let ok_marker = build_dir.join("ApcTool/Fingerprint.olean.ok");
+
+    if olean_path.is_file() && ok_marker.is_file() {
+        return Ok(build_dir);
+    }
+
+    if let Some(p) = src_path.parent() {
+        fs::create_dir_all(p).map_err(|e| VdashError::io_path(p, e))?;
+    }
+    if let Some(p) = olean_path.parent() {
+        fs::create_dir_all(p).map_err(|e| VdashError::io_path(p, e))?;
+    }
+
+    let lock_path = fp_root.join("compile.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| VdashError::io_path(&lock_path, e))?;
+    flock(&lock_file, FlockOperation::LockExclusive)
+        .map_err(|e| VdashError::new(5, format!("cannot lock {}: {e}", lock_path.display())))?;
+    let _lock = FileLock(lock_file);
+
+    if olean_path.is_file() && ok_marker.is_file() {
+        return Ok(build_dir);
+    }
+
+    let src = format!("import Lean\n\n{FINGERPRINT_LEAN}\n");
+    fs::write(&src_path, &src).map_err(|e| VdashError::io_path(&src_path, e))?;
+
+    let seq = DRIVER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_olean = olean_path.with_extension(format!("olean.{}.{seq}.tmp", std::process::id()));
+    let _slot = slots::acquire(ctx)?;
+    let mut cmd = lean::command(ctx, "lean")?;
+    cmd.arg("-R")
+        .arg(&src_dir)
+        .arg("-o")
+        .arg(&tmp_olean)
+        .arg(&src_path);
+
+    let out = proc::run(
+        &mut cmd,
+        None,
+        Duration::from_secs(ctx.cfg.budget.lean_timeout_s),
+    );
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_olean);
+            return Err(e);
+        }
+    };
+    if out.timed_out || out.status != Some(0) || !tmp_olean.is_file() {
+        let _ = fs::remove_file(&tmp_olean);
+        return Err(VdashError::new(
+            1,
+            format!(
+                "failed to precompile Fingerprint.lean (status {:?}):\n{}\n{}",
+                out.status,
+                out.stdout_lossy().trim(),
+                out.stderr_lossy().trim()
+            ),
+        ));
+    }
+
+    let _ = fs::remove_file(&ok_marker);
+    if let Err(e) = fs::rename(&tmp_olean, &olean_path) {
+        let _ = fs::remove_file(&tmp_olean);
+        return Err(VdashError::io_path(&olean_path, e));
+    }
+    fs::write(&ok_marker, "ok\n").map_err(|e| VdashError::io_path(&ok_marker, e))?;
+    Ok(build_dir)
+}
+
 fn run_driver(
     ctx: &Ctx,
     tree: &Path,
@@ -66,7 +161,13 @@ fn run_driver(
     mode: &str,
     names: &[String],
 ) -> Result<String> {
+    let fp_build = ensure_compiled(ctx)?;
     let lp = lean::lean_path(ctx, build_dir)?;
+    let full_lp = if lp.is_empty() {
+        fp_build.display().to_string()
+    } else {
+        format!("{}:{lp}", fp_build.display())
+    };
     let driver_dir = build_dir.join("_apc");
     fs::create_dir_all(&driver_dir).map_err(|e| VdashError::io_path(&driver_dir, e))?;
 
@@ -77,7 +178,7 @@ fn run_driver(
     let names_list = format!("[{}]", quoted_names.join(", "));
 
     let driver_src = format!(
-        "import Lean\nimport {root_module}\n\n{FINGERPRINT_LEAN}\n#eval ApcTool.main \"{mode}\" {names_list}\n"
+        "import ApcTool.Fingerprint\nimport {root_module}\n\n#eval ApcTool.main \"{mode}\" {names_list}\n"
     );
 
     let pid = std::process::id();
@@ -87,7 +188,7 @@ fn run_driver(
 
     let _slot = slots::acquire(ctx)?;
     let mut cmd = lean::command(ctx, "lean")?;
-    cmd.env("LEAN_PATH", &lp)
+    cmd.env("LEAN_PATH", &full_lp)
         .arg("-R")
         .arg(tree)
         .arg(&driver_path);

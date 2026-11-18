@@ -71,6 +71,9 @@ enum Commands {
     Gate {
         #[arg(long)]
         json: bool,
+        /// Ignore the gate cache in state_dir and rebuild from scratch
+        #[arg(long)]
+        fresh: bool,
     },
     /// Run the engine
     Prove {
@@ -306,9 +309,9 @@ fn run(cli: Cli) -> Result<()> {
             print!("{out}");
             Ok(())
         }
-        Some(Commands::Gate { json }) => {
+        Some(Commands::Gate { json, fresh }) => {
             let (ctx, _) = build_ctx(cli.campaign_dir.as_deref())?;
-            let (out, code) = gate::gate_cmd(&ctx, json)?;
+            let (out, code) = gate::gate_cmd_opts(&ctx, json, fresh)?;
             print!("{out}");
             if code == 0 {
                 Ok(())

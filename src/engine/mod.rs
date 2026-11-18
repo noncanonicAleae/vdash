@@ -46,12 +46,15 @@ pub struct Engine<'p> {
     pub decisions: Vec<(u32, crate::amend::Decision)>,
     /// Set once the engine has re-verified every "proved" goal in this run.
     pub rechecked: bool,
+    /// Last gate verdict keyed by `gate::input_digest`, avoiding duplicate runs
+    /// between `gate_post` and the next round's `gate_pre` (or unchanged rounds).
+    last_gate: Option<(String, gate::Verdict)>,
 }
 
 impl<'p> Engine<'p> {
     pub fn new(ctx: Ctx, pool: &'p Pool, opts: Opts, stop: Arc<AtomicBool>) -> Self {
         pool.set_stop(Arc::clone(&stop));
-        Engine { ctx, pool, stop, opts, snap: None, decisions: Vec::new(), rechecked: false }
+        Engine { ctx, pool, stop, opts, snap: None, decisions: Vec::new(), rechecked: false, last_gate: None }
     }
 
     pub fn state(&self) -> Result<State> {
@@ -183,8 +186,27 @@ impl<'p> Engine<'p> {
         record_engine_file(&self.ctx, rel);
     }
 
-    /// Run the gatekeeper and record per-target verdicts.
-    pub fn gate(&self, round: u32) -> Result<gate::Verdict> {
+    /// Run the gatekeeper and record per-target verdicts, reusing the previous
+    /// verdict in memory when `gate::input_digest` and the trust anchor are unchanged.
+    pub fn gate(&mut self, round: u32) -> Result<gate::Verdict> {
+        let use_cache = self.ctx.cfg.policy.comparator_cmd.trim().is_empty()
+            && crate::anchor::verify(&self.ctx).is_empty();
+        if use_cache {
+            if let Ok(digest) = gate::input_digest(&self.ctx) {
+                if let Some((ref prev_digest, ref prev_verdict)) = self.last_gate {
+                    if prev_digest == &digest {
+                        let v = prev_verdict.clone();
+                        record_verdict(&self.ctx, round, &v)?;
+                        return Ok(v);
+                    }
+                }
+                let v = gate::run(&self.ctx)?;
+                self.last_gate = Some((digest, v.clone()));
+                record_verdict(&self.ctx, round, &v)?;
+                return Ok(v);
+            }
+        }
+        self.last_gate = None;
         let v = gate::run(&self.ctx)?;
         record_verdict(&self.ctx, round, &v)?;
         Ok(v)

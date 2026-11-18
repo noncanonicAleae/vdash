@@ -21,9 +21,11 @@ pub fn acquire(ctx: &Ctx) -> Result<SlotGuard> {
     let slots_dir = ctx.campaign.build_slots_dir();
     fs::create_dir_all(&slots_dir).map_err(|e| VdashError::io_path(&slots_dir, e))?;
     let max = ctx.cfg.budget.max_parallel_lean.max(1);
+    let start = (std::process::id() as usize) % max;
 
     loop {
-        for i in 0..max {
+        for offset in 0..max {
+            let i = (start + offset) % max;
             let lock_path = slots_dir.join(format!("{i}.lock"));
             let file = OpenOptions::new()
                 .create(true)
@@ -35,7 +37,7 @@ pub fn acquire(ctx: &Ctx) -> Result<SlotGuard> {
                 return Ok(SlotGuard { file });
             }
         }
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

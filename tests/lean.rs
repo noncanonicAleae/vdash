@@ -662,3 +662,86 @@ fn m1_09_apc_approve_happy_path_sorry_in_spec_and_double_approve() {
         .assert()
         .code(2);
 }
+
+#[test]
+fn dag_scheduler_runs_independent_branches_and_isolates_failures() {
+    require_lean!();
+
+    let tmp = TempDir::new().unwrap();
+    let camp_dir = tmp.path().join("dag_camp");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let host = common::real_host_project();
+    paths::init_campaign(&camp_dir, &host, Some("isort"), &[BackendKind::Claude]).unwrap();
+
+    let ctx = Ctx::for_test(&camp_dir, &state_dir).unwrap();
+    let tree = ctx.campaign.lean_dir();
+    let build_dir = ctx.campaign.build_work_dir();
+
+    fs::write(tree.join("Apc/A.lean"), "def aVal : Nat := 1\n").unwrap();
+    fs::write(tree.join("Apc/B.lean"), "def bVal :=\n").unwrap();
+    fs::write(tree.join("Apc/C.lean"), "import Apc.A\ndef cVal : Nat := aVal + 1\n").unwrap();
+    fs::write(tree.join("Apc/D.lean"), "import Apc.B\ndef dVal : Nat := 2\n").unwrap();
+    fs::write(
+        tree.join("Apc/E.lean"),
+        "import Apc.C\nimport Apc.D\ndef eVal : Nat := cVal + dVal\n",
+    )
+    .unwrap();
+
+    let targets = ["Apc.E".to_string()];
+    let (rep1, keys1) = lean::build::build_with_keys(&ctx, &tree, &build_dir, Some(&targets)).unwrap();
+    assert!(!rep1.ok);
+    assert!(rep1.results["Apc.A"].ok);
+    assert!(rep1.results["Apc.C"].ok);
+    assert!(!rep1.results["Apc.B"].ok);
+    assert!(!rep1.results["Apc.D"].ok);
+    assert!(!rep1.results["Apc.E"].ok);
+    assert_eq!(rep1.results["Apc.D"].diagnostics[0].text, "dependency Apc.B failed");
+    assert_eq!(rep1.results["Apc.E"].diagnostics[0].text, "dependency Apc.B failed");
+    assert!(keys1.contains_key("Apc.A"));
+    assert!(keys1.contains_key("Apc.C"));
+    assert!(!keys1.contains_key("Apc.B"));
+
+    // Fix B: A and C hit cache; B, D, E compile and succeed.
+    fs::write(tree.join("Apc/B.lean"), "def bVal : Nat := 2\n").unwrap();
+    let (rep2, keys2) = lean::build::build_with_keys(&ctx, &tree, &build_dir, Some(&targets)).unwrap();
+    assert!(rep2.ok);
+    assert!(rep2.results["Apc.A"].cached);
+    assert!(rep2.results["Apc.C"].cached);
+    assert!(!rep2.results["Apc.B"].cached);
+    assert!(!rep2.results["Apc.D"].cached);
+    assert!(!rep2.results["Apc.E"].cached);
+    assert!(keys2.contains_key("Apc.E"));
+}
+
+#[test]
+fn fingerprint_memoizes_shared_closure_across_multiple_targets() {
+    require_lean!();
+
+    let tmp = TempDir::new().unwrap();
+    let camp_dir = tmp.path().join("fp_memo_camp");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let host = common::real_host_project();
+    paths::init_campaign(&camp_dir, &host, Some("isort"), &[BackendKind::Claude]).unwrap();
+
+    let ctx = Ctx::for_test(&camp_dir, &state_dir).unwrap();
+    let tree = ctx.campaign.lean_dir();
+    let build_dir = ctx.campaign.build_work_dir();
+    let rep = lean::build::build(&ctx, &tree, &build_dir, Some(&["Apc.Challenge".to_string()])).unwrap();
+    assert!(rep.ok);
+
+    let all = vdash::fingerprint::targets(&ctx, &tree, &build_dir).unwrap();
+    assert_eq!(all.len(), 4);
+    for (name, tfp) in &all {
+        let single = vdash::fingerprint::closure(
+            &ctx,
+            &tree,
+            &build_dir,
+            "Apc.Challenge",
+            std::slice::from_ref(name),
+        )
+        .unwrap();
+        assert_eq!(single.get(name), Some(tfp), "memoized multi-target fingerprint differed for {name}");
+    }
+}

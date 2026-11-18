@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -42,13 +43,20 @@ pub fn search_cmd(ctx: &Ctx, query: &str, offline: bool) -> Result<String> {
     }
 
     let mut out = String::new();
-    let local_hits = search_local(ctx, query, 25);
     let online_disabled = offline || std::env::var_os("VDASH_OFFLINE").is_some();
-    let loogle_hits = if online_disabled {
-        Vec::new()
-    } else {
-        query_loogle(query, 15).unwrap_or_default()
-    };
+    let (local_hits, loogle_hits) = std::thread::scope(|s| {
+        let local_h = s.spawn(|| search_local(ctx, query, 25));
+        let loogle_h = if online_disabled {
+            None
+        } else {
+            Some(s.spawn(|| query_loogle(query, 15).unwrap_or_default()))
+        };
+        let local_hits = local_h.join().unwrap_or_default();
+        let loogle_hits = loogle_h
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        (local_hits, loogle_hits)
+    });
 
     if local_hits.is_empty() && loogle_hits.is_empty() {
         out.push_str(&format!("no matches found for '{query}'\n"));
@@ -109,6 +117,29 @@ pub fn search_local(ctx: &Ctx, query: &str, limit: usize) -> Vec<SearchHit> {
     search_roots(&roots, query, limit)
 }
 
+fn contains_ascii_ci(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.len() > haystack.len() {
+        return false;
+    }
+    let first = needle_lower[0];
+    let first_upper = first.to_ascii_uppercase();
+    let limit = haystack.len() - needle_lower.len();
+    let mut i = 0;
+    while i <= limit {
+        let b = haystack[i];
+        if (b == first || b == first_upper)
+            && haystack[i..i + needle_lower.len()].eq_ignore_ascii_case(needle_lower)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn search_roots(roots: &[(String, PathBuf)], query: &str, limit: usize) -> Vec<SearchHit> {
     let tokens: Vec<String> = query
         .split_whitespace()
@@ -119,9 +150,23 @@ pub fn search_roots(roots: &[(String, PathBuf)], query: &str, limit: usize) -> V
         return Vec::new();
     }
     let q_lower = query.trim().to_lowercase();
+    let segments: Vec<&str> = tokens
+        .iter()
+        .flat_map(|t| t.split('.').filter(|x| !x.is_empty()))
+        .collect();
+    let ascii_segs: Vec<&[u8]> = segments
+        .iter()
+        .filter(|s| s.is_ascii())
+        .map(|s| s.as_bytes())
+        .collect();
+    let non_ascii_segs: Vec<&str> = segments
+        .iter()
+        .copied()
+        .filter(|s| !s.is_ascii())
+        .collect();
 
-    let mut hits = Vec::new();
-    for (tag, root) in roots {
+    let mut files: Vec<(usize, PathBuf)> = Vec::new();
+    for (root_idx, (tag, root)) in roots.iter().enumerate() {
         let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             if e.depth() > 0 && e.file_type().is_dir() {
@@ -143,22 +188,67 @@ pub fn search_roots(roots: &[(String, PathBuf)], query: &str, limit: usize) -> V
                 continue;
             }
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("lean") {
-                continue;
+            if path.extension().and_then(|s| s.to_str()) == Some("lean") {
+                files.push((root_idx, path.to_path_buf()));
             }
-            let Ok(content) = fs::read_to_string(path) else {
-                continue;
-            };
-            // Quick pre-filter: at least one token must appear in the file (case-insensitive)
-            let content_lower = content.to_lowercase();
-            if !tokens.iter().all(|t| t.split('.').filter(|x| !x.is_empty()).all(|seg| content_lower.contains(seg))) {
-                continue;
-            }
-            let module = module_name_from_path(root, path, tag);
-            let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
-            extract_file_hits(&content, &module, &format!("{tag}:{rel}"), &tokens, &q_lower, &mut hits);
         }
     }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(files.len().max(1));
+    let next_idx = AtomicUsize::new(0);
+
+    let mut hits: Vec<SearchHit> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(s.spawn(|| {
+                let mut local_hits = Vec::new();
+                loop {
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    let Some((root_idx, path)) = files.get(idx) else {
+                        break;
+                    };
+                    let Ok(bytes) = fs::read(path) else {
+                        continue;
+                    };
+                    if !ascii_segs.iter().all(|seg| contains_ascii_ci(&bytes, seg)) {
+                        continue;
+                    }
+                    let Ok(content) = String::from_utf8(bytes) else {
+                        continue;
+                    };
+                    if !non_ascii_segs.is_empty() {
+                        let content_lower = content.to_lowercase();
+                        if !non_ascii_segs.iter().all(|seg| content_lower.contains(seg)) {
+                            continue;
+                        }
+                    }
+                    let (tag, root) = &roots[*root_idx];
+                    let module = module_name_from_path(root, path, tag);
+                    let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
+                    extract_file_hits(
+                        &content,
+                        &module,
+                        &format!("{tag}:{rel}"),
+                        &tokens,
+                        &q_lower,
+                        &mut local_hits,
+                    );
+                }
+                local_hits
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            if let Ok(lh) = h.join() {
+                all.extend(lh);
+            }
+        }
+        all
+    });
 
     hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
     hits.truncate(limit);
@@ -558,6 +648,10 @@ def Sorted (r : α → α → Prop) : List α → Prop
         let hits2 = search_roots(&roots, "Sorted", 10);
         assert!(!hits2.is_empty());
         assert_eq!(hits2[0].name, "Sorted");
+
+        let unicode = search_roots(&roots, "α", 10);
+        assert!(!unicode.is_empty());
+        assert_eq!(unicode[0].name, "Sorted");
     }
 
     #[test]

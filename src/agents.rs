@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::backend::pool::Pool;
-use crate::backend::{AgentCall, Profile};
+use crate::backend::{AgentCall, Profile, Resume, Session};
 use crate::config::Role;
 use crate::error::Result;
 use crate::events;
@@ -43,11 +43,22 @@ pub struct Request<'a> {
     pub label: String,
     /// Override the role's default profile.
     pub profile: Option<Profile>,
+    /// Continue this earlier session with this message when the pool picks the
+    /// same backend; the full prompt is the fallback.
+    pub resume: Option<Resume>,
+}
+
+/// One finished agent call.
+pub struct Ran {
+    pub id: String,
+    pub outcome: Outcome,
+    /// The session to continue in a follow-up call.
+    pub session: Option<Session>,
 }
 
 impl<'a> Request<'a> {
     pub fn new(role: Role, reply: Reply, task: impl Into<String>) -> Self {
-        Request { role, reply, task: task.into(), sections: Vec::new(), label: String::new(), profile: None }
+        Request { role, reply, task: task.into(), sections: Vec::new(), label: String::new(), profile: None, resume: None }
     }
 
     pub fn section(mut self, name: &'a str, body: impl Into<String>) -> Self {
@@ -62,6 +73,12 @@ impl<'a> Request<'a> {
 
     pub fn profile(mut self, p: Profile) -> Self {
         self.profile = Some(p);
+        self
+    }
+
+    /// Resume `session` with `message` instead of sending the whole prompt again.
+    pub fn resume(mut self, session: Option<Session>, message: impl Into<String>) -> Self {
+        self.resume = session.map(|session| Resume { session, prompt: message.into() });
         self
     }
 }
@@ -109,6 +126,11 @@ fn record_usage(ctx: &Ctx, role: Role, backend: &str, cost: f64, seconds: f64) {
 /// `Outcome::Failed` so callers can carry on. `Err` is reserved for code 4 (every
 /// backend unusable) and local I/O errors.
 pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(String, Outcome)> {
+    run_full(ctx, pool, round, req).map(|r| (r.id, r.outcome))
+}
+
+/// [`run`], also returning the session a follow-up call can resume.
+pub fn run_full(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<Ran> {
     let id = next_agent_id(ctx, req.role);
     let skill = skills::load(&ctx.campaign, req.role)?;
     let prompt = prompts::build(&req.task, &req.sections);
@@ -122,6 +144,7 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
         profile: req.profile.unwrap_or_else(|| Profile::for_role(req.role)),
         model: None,
         timeout: Duration::from_secs(ctx.cfg.budget.agent_timeout_s),
+        resume: req.resume.clone(),
     };
     let started = util::now_iso();
     events::emit(ctx, round, "agent_started", json!({"agent": id, "role": req.role.to_string(), "goal": req.label}));
@@ -132,10 +155,15 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
     };
     let served = pool.run_cb(ctx, round, req.role, &call, &announce)?;
     let mut result = served.result;
-    let backend = served.entry.backend.to_string();
+    let backend_kind = served.entry.backend;
+    let backend = backend_kind.to_string();
     let model = served.entry.model.clone();
     let mut cost = result.cost_usd.unwrap_or(0.0);
     let mut secs = result.seconds;
+    let mut waited = served.waited.as_secs_f64();
+    let resumed = result.resumed;
+    let sent_prompt = if resumed { call.resume.as_ref().map(|r| r.prompt.clone()).unwrap_or_default() } else { prompt.clone() };
+    let mut session = result.session.clone().map(|id| Session { backend: backend_kind, id });
 
     let validate = |r: &crate::backend::AgentResult| -> Vec<String> {
         match &r.structured {
@@ -165,20 +193,29 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
             Outcome::Failed(format!("stopped before a repair attempt: {}", errs.join("; ")))
         } else {
             attempts.push(json!({"argv": result.argv, "raw": result.raw, "errors": errs}));
-            // One repair attempt on the same role.
+            // One repair attempt on the same role. With a session it continues the
+            // same conversation, which already holds the prompt and the bad reply.
+            let previous = util::clip(
+                &result.structured.as_ref().map(|v| v.to_string()).unwrap_or_else(|| result.text.clone()),
+                8000,
+                false,
+            );
+            let errors = errs.join("\n");
             let repair_prompt = format!(
-                "{prompt}\n<previous_reply>\n{}\n</previous_reply>\n<validation_errors>\n{}\n</validation_errors>\nYour previous reply did not match the required JSON shape. Reply again with one JSON object that fixes every error above.\n",
-                util::clip(
-                    &result.structured.as_ref().map(|v| v.to_string()).unwrap_or_else(|| result.text.clone()),
-                    8000,
-                    false
-                ),
-                errs.join("\n")
+                "{prompt}\n<previous_reply>\n{previous}\n</previous_reply>\n<validation_errors>\n{errors}\n</validation_errors>\nYour previous reply did not match the required JSON shape. Reply again with one JSON object that fixes every error above.\n"
             );
             let mut c2 = call.clone();
             c2.prompt = repair_prompt;
+            c2.resume = session.clone().map(|session| Resume {
+                session,
+                prompt: format!("<validation_errors>\n{errors}\n</validation_errors>\nYour previous reply did not match the required JSON shape. Reply again with one JSON object that fixes every error above.\n"),
+            });
             let s2 = pool.run(ctx, round, req.role, &c2)?;
             result = s2.result;
+            waited += s2.waited.as_secs_f64();
+            if let Some(sid) = result.session.clone() {
+                session = Some(Session { backend: s2.entry.backend, id: sid });
+            }
             cost += result.cost_usd.unwrap_or(0.0);
             secs += result.seconds;
             match &result.failure {
@@ -216,6 +253,8 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
         "finished": util::now_iso(),
         "argv": result.argv,
         "prompt": prompt,
+        "resumed": resumed.then(|| call.resume.as_ref().map(|r| r.session.id.clone())).flatten(),
+        "sent_prompt": if resumed { Some(sent_prompt) } else { None },
         "raw": result.raw,
         "earlier_attempts": attempts,
         "reply": outcome.ok(),
@@ -224,6 +263,7 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
         "cost_usd": cost,
         "tokens": result.tokens,
         "seconds": secs,
+        "waited_s": waited,
     });
     let path = ctx.campaign.round_logs_dir(round).join(format!("{id}.json"));
     jsonio::write_atomic(&path, &transcript)?;
@@ -236,9 +276,9 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
         ctx,
         round,
         "agent_finished",
-        json!({"agent": id, "role": req.role.to_string(), "backend": backend, "goal": req.label, "failure": failure, "cost_usd": cost, "seconds": secs}),
+        json!({"agent": id, "role": req.role.to_string(), "backend": backend, "goal": req.label, "failure": failure, "cost_usd": cost, "seconds": secs, "waited_s": waited, "resumed": resumed}),
     );
-    Ok((id, outcome))
+    Ok(Ran { id, outcome, session })
 }
 
 #[cfg(test)]
@@ -292,7 +332,10 @@ mod tests {
         let (_, out) = run(&c, &pool, 1, Request::new(Role::Monitor, Reply::Monitor, "q")).unwrap();
         assert_eq!(out, Outcome::Ok(good()));
         let calls = fb.calls.lock().unwrap();
+        // The repair resumes the first call's session with only the errors.
         assert!(calls[1].prompt.contains("<validation_errors>"));
+        assert_eq!(calls[1].resumed.as_deref(), Some("fake-claude-1"));
+        assert!(!calls[1].prompt.contains("<task>"), "{}", calls[1].prompt);
         drop(calls);
         fb.reply(Role::Monitor, json!({})).reply(Role::Monitor, json!({}));
         let (_, out) = run(&c, &pool, 1, Request::new(Role::Monitor, Reply::Monitor, "q")).unwrap();

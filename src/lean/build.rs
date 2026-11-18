@@ -489,14 +489,26 @@ pub fn build(
     build_dir: &Path,
     targets: Option<&[String]>,
 ) -> Result<BuildReport> {
-    let mut rep = build_once(ctx, tree, build_dir, targets)?;
+    build_with_keys(ctx, tree, build_dir, targets).map(|(rep, _)| rep)
+}
+
+/// Same as [`build`], also returning each built module's cache key.
+pub fn build_with_keys(
+    ctx: &Ctx,
+    tree: &Path,
+    build_dir: &Path,
+    targets: Option<&[String]>,
+) -> Result<(BuildReport, BTreeMap<String, String>)> {
+    let (mut rep, mut keys) = build_once(ctx, tree, build_dir, targets)?;
     while rep.retries < INFRA_RETRIES && rep.results.values().any(infra_failure) {
         let retries = rep.retries + 1;
         std::thread::sleep(Duration::from_millis(300));
-        rep = build_once(ctx, tree, build_dir, targets)?;
+        let next = build_once(ctx, tree, build_dir, targets)?;
+        rep = next.0;
+        keys = next.1;
         rep.retries = retries;
     }
-    Ok(rep)
+    Ok((rep, keys))
 }
 
 fn build_once(
@@ -504,11 +516,12 @@ fn build_once(
     tree: &Path,
     build_dir: &Path,
     targets: Option<&[String]>,
-) -> Result<BuildReport> {
+) -> Result<(BuildReport, BTreeMap<String, String>)> {
     let scan = imports::scan_imports(tree)?;
     let graph = scope_graph_for_targets(tree, scan, targets)?;
 
-    let levels = imports::topo_levels(&graph)?;
+    // Validates acyclicity and keeps the exact import cycle diagnostic.
+    let _levels = imports::topo_levels(&graph)?;
     let tc = lean::toolchain(&ctx.cfg)?;
     let lp = lean::lean_path(ctx, build_dir)?;
 
@@ -516,84 +529,163 @@ fn build_once(
     let mut module_keys: BTreeMap<String, String> = BTreeMap::new();
     let mut root_failure: BTreeMap<String, String> = BTreeMap::new();
 
-    for level in levels {
-        let mut to_compile: Vec<(String, String)> = Vec::new();
+    if graph.is_empty() {
+        return Ok((BuildReport { results, ok: true, retries: 0 }, module_keys));
+    }
 
-        for m in level {
-            let deps = graph.get(&m).cloned().unwrap_or_default();
-            let failed_dep = deps
-                .iter()
-                .find(|d| results.get(*d).map(|r| !r.ok).unwrap_or(true));
+    let mut rdeps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut remaining_deps: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ready: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
-            if let Some(fd) = failed_dep {
-                let root_failed = root_failure
-                    .get(fd)
-                    .cloned()
-                    .unwrap_or_else(|| fd.clone());
-                let olean_path = module_olean_path(build_dir, &m);
-                {
-                    let _lock = lock_module(&olean_path)?;
-                    invalidate_cache_entry(&olean_path);
-                }
-                let default_rel = format!("lean/{}.lean", module_rel_stem(&m).display());
-                root_failure.insert(m.clone(), root_failed.clone());
-                results.insert(
-                    m.clone(),
-                    ModuleResult {
-                        module: m,
-                        ok: false,
-                        cached: false,
-                        seconds: 0.0,
-                        diagnostics: vec![Diagnostic {
-                            file: default_rel,
-                            line: 1,
-                            col: 1,
-                            severity: "error".to_string(),
-                            kind: "depFailed".to_string(),
-                            text: format!("dependency {root_failed} failed"),
-                        }],
-                    },
-                );
-            } else {
-                let src_path = module_src_path(tree, &m);
-                let src_bytes =
-                    fs::read(&src_path).map_err(|e| VdashError::io_path(&src_path, e))?;
-                let key = compute_cache_key(&src_bytes, &deps, &module_keys, &tc, &lp);
-                module_keys.insert(m.clone(), key.clone());
-                to_compile.push((m, key));
+    for (m, deps) in &graph {
+        rdeps.entry(m.clone()).or_default();
+        let mut count = 0usize;
+        for d in deps {
+            if graph.contains_key(d) {
+                count += 1;
+                rdeps.entry(d.clone()).or_default().push(m.clone());
             }
         }
-
-        if !to_compile.is_empty() {
-            let level_results: Vec<Result<ModuleResult>> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(to_compile.len());
-                for (m, key) in &to_compile {
-                    let lp_ref = lp.as_str();
-                    handles.push(s.spawn(move || {
-                        compile_single_module(ctx, tree, build_dir, lp_ref, m, key)
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err(VdashError::new(5, "worker thread panicked")))
-                    })
-                    .collect()
-            });
-
-            for res in level_results {
-                let mr = res?;
-                if !mr.ok {
-                    root_failure.insert(mr.module.clone(), mr.module.clone());
-                }
-                results.insert(mr.module.clone(), mr);
-            }
+        remaining_deps.insert(m.clone(), count);
+        if count == 0 {
+            ready.push_back(m.clone());
         }
     }
 
+    let mut first_err: Option<VdashError> = None;
+    let lp_ref = lp.as_str();
+
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<ModuleResult>>();
+        let mut in_flight = 0usize;
+
+        while (!ready.is_empty() && first_err.is_none()) || in_flight > 0 {
+            while first_err.is_none() {
+                let Some(m) = ready.pop_front() else {
+                    break;
+                };
+                let deps = graph.get(&m).map(Vec::as_slice).unwrap_or(&[]);
+                let failed_dep = deps
+                    .iter()
+                    .find(|d| results.get(*d).map(|r| !r.ok).unwrap_or(true));
+
+                if let Some(fd) = failed_dep {
+                    let root_failed = root_failure
+                        .get(fd)
+                        .cloned()
+                        .unwrap_or_else(|| fd.clone());
+                    let olean_path = module_olean_path(build_dir, &m);
+                    match lock_module(&olean_path) {
+                        Ok(_lock) => invalidate_cache_entry(&olean_path),
+                        Err(e) => {
+                            first_err = Some(e);
+                            break;
+                        }
+                    }
+                    let default_rel = format!("lean/{}.lean", module_rel_stem(&m).display());
+                    root_failure.insert(m.clone(), root_failed.clone());
+                    results.insert(
+                        m.clone(),
+                        ModuleResult {
+                            module: m.clone(),
+                            ok: false,
+                            cached: false,
+                            seconds: 0.0,
+                            diagnostics: vec![Diagnostic {
+                                file: default_rel,
+                                line: 1,
+                                col: 1,
+                                severity: "error".to_string(),
+                                kind: "depFailed".to_string(),
+                                text: format!("dependency {root_failed} failed"),
+                            }],
+                        },
+                    );
+                    if let Some(children) = rdeps.get(&m) {
+                        for child in children {
+                            if let Some(rem) = remaining_deps.get_mut(child) {
+                                *rem = rem.saturating_sub(1);
+                                if *rem == 0 {
+                                    ready.push_back(child.clone());
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let src_path = module_src_path(tree, &m);
+                    let src_bytes = match fs::read(&src_path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            first_err = Some(VdashError::io_path(&src_path, e));
+                            break;
+                        }
+                    };
+                    let key = compute_cache_key(&src_bytes, deps, &module_keys, &tc, &lp);
+                    module_keys.insert(m.clone(), key.clone());
+                    let tx_c = tx.clone();
+                    s.spawn(move || {
+                        struct PanicNotify(Option<std::sync::mpsc::Sender<Result<ModuleResult>>>);
+                        impl Drop for PanicNotify {
+                            fn drop(&mut self) {
+                                if let Some(tx) = self.0.take() {
+                                    let _ = tx.send(Err(VdashError::new(5, "worker thread panicked")));
+                                }
+                            }
+                        }
+                        let mut guard = PanicNotify(Some(tx_c));
+                        let res = compile_single_module(ctx, tree, build_dir, lp_ref, &m, &key);
+                        if let Some(tx) = guard.0.take() {
+                            let _ = tx.send(res);
+                        }
+                    });
+                    in_flight += 1;
+                }
+            }
+
+            if in_flight > 0 {
+                match rx.recv() {
+                    Ok(Ok(mr)) => {
+                        in_flight -= 1;
+                        let m_name = mr.module.clone();
+                        if !mr.ok {
+                            root_failure.insert(m_name.clone(), m_name.clone());
+                            module_keys.remove(&m_name);
+                        }
+                        results.insert(m_name.clone(), mr);
+                        if let Some(children) = rdeps.get(&m_name) {
+                            for child in children {
+                                if let Some(rem) = remaining_deps.get_mut(child) {
+                                    *rem = rem.saturating_sub(1);
+                                    if *rem == 0 {
+                                        ready.push_back(child.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        in_flight -= 1;
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    Err(_) => {
+                        in_flight -= 1;
+                        if first_err.is_none() {
+                            first_err = Some(VdashError::new(5, "worker thread panicked"));
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+
     let ok = results.values().all(|r| r.ok);
-    Ok(BuildReport { results, ok, retries: 0 })
+    Ok((BuildReport { results, ok, retries: 0 }, module_keys))
 }
 
 pub fn truncate_text(text: &str, max_chars: usize) -> String {

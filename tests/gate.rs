@@ -386,3 +386,92 @@ end Apc
         assert_eq!(tv.reasons, vec![ReasonCode::AnchorMismatch]);
     }
 }
+
+#[test]
+fn gate_cache_reuses_unchanged_parallel_leanchecker_and_fresh_rebuilds() {
+    require_lean!();
+
+    let tmp = TempDir::new().unwrap();
+    let camp_dir = tmp.path().join("gate_cache_camp");
+    let xdg_state = tmp.path().join("xdg_state");
+    fs::create_dir_all(&xdg_state).unwrap();
+    let host = common::real_host_project();
+    let apc_bin = assert_cmd::cargo::cargo_bin!("vdash");
+
+    assert_cmd::Command::new(apc_bin)
+        .args([
+            "init",
+            camp_dir.to_str().unwrap(),
+            "--host",
+            host.to_str().unwrap(),
+            "--example",
+            "isort",
+        ])
+        .assert()
+        .success();
+
+    assert_cmd::Command::new(apc_bin)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["-C", camp_dir.to_str().unwrap(), "approve"])
+        .assert()
+        .success();
+
+    let camp = Campaign::new(&camp_dir);
+    let cfg = vdash::config::load(&camp_dir).unwrap();
+    let state_dir = xdg_state.join("vdash").join(&cfg.id);
+    let ctx = Ctx {
+        campaign: camp.clone(),
+        cfg,
+        state_dir: state_dir.clone(),
+        exe: std::path::PathBuf::from(apc_bin),
+    };
+
+    // Add two untrusted Proof modules imported by Solution.lean so parallel leanchecker runs.
+    fs::create_dir_all(camp.proof_lib_dir()).unwrap();
+    let mod_a = camp.proof_lib_dir().join("HelperA.lean");
+    let mod_b = camp.proof_lib_dir().join("HelperB.lean");
+    fs::write(&mod_a, "theorem helper_a : 1 + 1 = 2 := rfl\n").unwrap();
+    fs::write(&mod_b, "theorem helper_b : 2 + 2 = 4 := rfl\n").unwrap();
+    let sol = format!(
+        "import Apc.Proof.Lib.HelperA\nimport Apc.Proof.Lib.HelperB\n{}",
+        paths::ISORT_REFERENCE_SOLUTION
+    );
+    fs::write(camp.solution_file(), &sol).unwrap();
+
+    let v1 = gate::run(&ctx).unwrap();
+    assert!(v1.ok, "first gate run failed: {v1:?}");
+
+    let gate_cache = state_dir.join("gate_cache");
+    assert!(gate_cache.join("sol_fps.json").is_file());
+    assert!(gate_cache.join("sol_build/Apc/Solution.olean.lc_ok").is_file());
+    assert!(gate_cache.join("sol_build/Apc/Proof/Lib/HelperA.olean.lc_ok").is_file());
+    assert!(gate_cache.join("sol_build/Apc/Proof/Lib/HelperB.olean.lc_ok").is_file());
+    assert!(state_dir.join("fp_cache").is_dir());
+
+    // Second run with no edits hits cache and produces identical verdict.
+    let v2 = gate::run(&ctx).unwrap();
+    assert_eq!(v1, v2);
+
+    // Dropping HelperB from Solution.lean prunes stale HelperB.olean from gate_cache/sol_build.
+    fs::write(
+        camp.solution_file(),
+        format!("import Apc.Proof.Lib.HelperA\n{}", paths::ISORT_REFERENCE_SOLUTION),
+    )
+    .unwrap();
+    let v3 = gate::run(&ctx).unwrap();
+    assert!(v3.ok, "third gate run failed: {v3:?}");
+    assert!(!gate_cache.join("sol_build/Apc/Proof/Lib/HelperB.olean").exists());
+    assert!(gate_cache.join("sol_build/Apc/Proof/Lib/HelperA.olean.lc_ok").is_file());
+
+    // `--fresh` ignores the cache and exits 0.
+    let out_fresh = assert_cmd::Command::new(apc_bin)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["-C", camp_dir.to_str().unwrap(), "gate", "--fresh", "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let v_fresh: Verdict = serde_json::from_slice(&out_fresh).unwrap();
+    assert_eq!(v_fresh, v3);
+}

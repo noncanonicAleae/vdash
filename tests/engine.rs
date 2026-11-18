@@ -307,8 +307,9 @@ fn solution_partial_sorry_checked_per_theorem_and_sandbox_stuck_recovered() {
     let plan: serde_json::Value = vdash::jsonio::read_json(ctx.campaign.plan_file()).unwrap();
     let l1_file = plan["goals"].as_array().unwrap().iter().find(|g| g["id"] == "l1").unwrap()["file"].as_str().unwrap();
     assert_eq!(l1_file, "lean/Apc/Proof/Work/Actual.lean");
-    // t3 ran only once (no wasted retries on OK (N sorry)); l1 ran twice (stuck -> confirm proved).
-    assert_eq!(claude.count(Role::Worker), 3);
+    // t3 ran only once (no wasted retries on OK (N sorry)); l1 ran once too: its file
+    // checks cleanly, so the engine records it proved without a confirm call.
+    assert_eq!(claude.count(Role::Worker), 2);
 }
 
 /// The sequent-calculus failure modes: a goal marked proved whose file no longer
@@ -445,4 +446,34 @@ fn resolve_escalation_through_the_engine_inbox() {
     assert!(matches!(eng.checkpoint(3).unwrap(), engine::Flow::Continue));
     let evs = vdash::events::tail(&ctx.campaign.events_file(), 10).0;
     assert!(evs.iter().any(|e| e.kind == "note" && e.str("text").contains("there is no escalation #9")));
+}
+
+#[test]
+fn engine_in_memory_gate_cache_handles_unchanged_and_changed_rounds() {
+    require_lean!();
+    let tmp = TempDir::new().unwrap();
+    let ctx = approved_isort(&tmp);
+    let fb = Arc::new(FakeBackend::new(BackendKind::Claude));
+    let root = ctx.campaign.root.clone();
+    for _ in 0..(1 + vdash::engine::team::WORKER_RETRIES) {
+        let r = root.clone();
+        fb.func(Role::Worker, move |_call| {
+            // Round 1: only write an unimported scratch file; Solution.lean is unchanged.
+            fs::write(r.join("lean/Apc/Proof/Work/Scratch.lean"), "def x : Nat := 1\n").unwrap();
+            worker_reply("all", &TARGETS)
+        });
+    }
+    fb.func(Role::Worker, move |_call| {
+        // Round 2: write reference solution.
+        fs::write(root.join("lean/Apc/Solution.lean"), paths::ISORT_REFERENCE_SOLUTION).unwrap();
+        worker_reply("all", &TARGETS)
+    });
+    let pool = Pool::new(&ctx, vec![fb]);
+    assert_eq!(run(&ctx, &pool, 2, true), 0);
+    let st = vdash::util::load_state(&ctx.campaign).unwrap();
+    assert_eq!(st.phase, "done");
+    assert!(st.targets.values().all(|t| t.accepted));
+    let evs = vdash::events::tail(&ctx.campaign.events_file(), 100).0;
+    let gate_evs: Vec<_> = evs.iter().filter(|e| e.kind == "gate").collect();
+    assert_eq!(gate_evs.len(), 4, "expected 4 gate events across 2 rounds: {gate_evs:?}");
 }
