@@ -141,32 +141,60 @@ impl Campaign {
         self.root.join("lean")
     }
 
+    pub fn pkg_dir(&self, pkg: &str) -> PathBuf {
+        self.root.join("lean").join(pkg)
+    }
+
+    pub fn lean_spec_dir_for(&self, pkg: &str) -> PathBuf {
+        self.pkg_dir(pkg).join("Spec")
+    }
+
+    pub fn challenge_file_for(&self, pkg: &str) -> PathBuf {
+        self.pkg_dir(pkg).join("Challenge.lean")
+    }
+
+    pub fn solution_file_for(&self, pkg: &str) -> PathBuf {
+        self.pkg_dir(pkg).join("Solution.lean")
+    }
+
+    pub fn proof_dir_for(&self, pkg: &str) -> PathBuf {
+        self.pkg_dir(pkg).join("Proof")
+    }
+
+    pub fn proof_lib_dir_for(&self, pkg: &str) -> PathBuf {
+        self.pkg_dir(pkg).join("Proof/Lib")
+    }
+
+    pub fn proof_work_dir_for(&self, pkg: &str) -> PathBuf {
+        self.pkg_dir(pkg).join("Proof/Work")
+    }
+
     pub fn apc_dir(&self) -> PathBuf {
-        self.root.join("lean/Apc")
+        self.pkg_dir("Apc")
     }
 
     pub fn lean_spec_dir(&self) -> PathBuf {
-        self.root.join("lean/Apc/Spec")
+        self.lean_spec_dir_for("Apc")
     }
 
     pub fn challenge_file(&self) -> PathBuf {
-        self.root.join("lean/Apc/Challenge.lean")
+        self.challenge_file_for("Apc")
     }
 
     pub fn solution_file(&self) -> PathBuf {
-        self.root.join("lean/Apc/Solution.lean")
+        self.solution_file_for("Apc")
     }
 
     pub fn proof_dir(&self) -> PathBuf {
-        self.root.join("lean/Apc/Proof")
+        self.proof_dir_for("Apc")
     }
 
     pub fn proof_lib_dir(&self) -> PathBuf {
-        self.root.join("lean/Apc/Proof/Lib")
+        self.proof_lib_dir_for("Apc")
     }
 
     pub fn proof_work_dir(&self) -> PathBuf {
-        self.root.join("lean/Apc/Proof/Work")
+        self.proof_work_dir_for("Apc")
     }
 
     pub fn heldout_dir(&self) -> PathBuf {
@@ -264,13 +292,13 @@ impl Campaign {
         module_path(name)
     }
 
-    pub fn trusted_files(&self) -> Vec<PathBuf> {
+    pub fn trusted_files_for(&self, pkg: &str) -> Vec<PathBuf> {
         let mut files = Vec::new();
-        let challenge = self.challenge_file();
+        let challenge = self.challenge_file_for(pkg);
         if challenge.is_file() {
-            files.push(PathBuf::from("lean/Apc/Challenge.lean"));
+            files.push(PathBuf::from(format!("lean/{pkg}/Challenge.lean")));
         }
-        let spec_dir = self.lean_spec_dir();
+        let spec_dir = self.lean_spec_dir_for(pkg);
         if spec_dir.is_dir() {
             for entry in WalkDir::new(&spec_dir)
                 .follow_links(false)
@@ -289,6 +317,10 @@ impl Campaign {
         }
         files.sort();
         files
+    }
+
+    pub fn trusted_files(&self) -> Vec<PathBuf> {
+        self.trusted_files_for("Apc")
     }
 }
 
@@ -403,18 +435,40 @@ fn generate_campaign_id() -> Result<String> {
     Ok(s)
 }
 
-pub const ISORT_SPEC_IMPL: &str = include_str!("../examples/isort/lean/Apc/Spec/Impl.lean");
-pub const ISORT_SPEC_DEFS: &str = include_str!("../examples/isort/lean/Apc/Spec/Defs.lean");
-pub const ISORT_SPEC_MUTANTS: &str = include_str!("../examples/isort/lean/Apc/Spec/Mutants.lean");
-pub const ISORT_SPEC_TESTS: &str = include_str!("../examples/isort/lean/Apc/Spec/Tests.lean");
-pub const ISORT_CHALLENGE: &str = include_str!("../examples/isort/lean/Apc/Challenge.lean");
+pub const ISORT_SPEC_IMPL: &str = include_str!("../examples/isort/lean/Isort/Spec/Impl.lean");
+pub const ISORT_SPEC_DEFS: &str = include_str!("../examples/isort/lean/Isort/Spec/Defs.lean");
+pub const ISORT_SPEC_MUTANTS: &str = include_str!("../examples/isort/lean/Isort/Spec/Mutants.lean");
+pub const ISORT_SPEC_TESTS: &str = include_str!("../examples/isort/lean/Isort/Spec/Tests.lean");
+pub const ISORT_CHALLENGE: &str = include_str!("../examples/isort/lean/Isort/Challenge.lean");
 pub const ISORT_REFERENCE_SOLUTION: &str =
     include_str!("../examples/isort/reference/Solution.lean");
+
+pub fn rewrite_isort_package(src: &str, pkg: &str) -> String {
+    if pkg == "Isort" {
+        src.to_string()
+    } else {
+        src.replace("Isort", pkg)
+    }
+}
+
+pub fn isort_reference_solution(pkg: &str) -> String {
+    rewrite_isort_package(ISORT_REFERENCE_SOLUTION, pkg)
+}
 
 pub fn init_campaign(
     dir: impl AsRef<Path>,
     host: impl AsRef<Path>,
     example: Option<&str>,
+    available_backends: &[BackendKind],
+) -> Result<Option<String>> {
+    init_campaign_with_package(dir, host, example, Some("Apc"), available_backends)
+}
+
+pub fn init_campaign_with_package(
+    dir: impl AsRef<Path>,
+    host: impl AsRef<Path>,
+    example: Option<&str>,
+    package: Option<&str>,
     available_backends: &[BackendKind],
 ) -> Result<Option<String>> {
     let dir = dir.as_ref();
@@ -424,6 +478,14 @@ pub fn init_campaign(
         None => false,
         Some("isort") => true,
         Some(ex) => return Err(VdashError::new(2, format!("unknown example '{ex}'"))),
+    };
+
+    let pkg = match package {
+        Some(p) => {
+            config::validate_package(p)?;
+            p.to_string()
+        }
+        None => config::default_package_for_dir(dir),
     };
 
     if !host.is_dir() {
@@ -464,9 +526,9 @@ pub fn init_campaign(
         camp.sources_dir(),
         camp.skills_dir(),
         camp.spec_dir(),
-        camp.lean_spec_dir(),
-        camp.proof_lib_dir(),
-        camp.proof_work_dir(),
+        camp.lean_spec_dir_for(&pkg),
+        camp.proof_lib_dir_for(&pkg),
+        camp.proof_work_dir_for(&pkg),
         camp.heldout_tree(),
         camp.build_work_dir(),
         camp.build_gate_dir(),
@@ -481,20 +543,21 @@ pub fn init_campaign(
 
     if is_isort {
         for (rel, content) in [
-            ("lean/Apc/Spec/Impl.lean", ISORT_SPEC_IMPL),
-            ("lean/Apc/Spec/Defs.lean", ISORT_SPEC_DEFS),
-            ("lean/Apc/Spec/Mutants.lean", ISORT_SPEC_MUTANTS),
-            ("lean/Apc/Spec/Tests.lean", ISORT_SPEC_TESTS),
-            ("lean/Apc/Challenge.lean", ISORT_CHALLENGE),
+            (format!("lean/{pkg}/Spec/Impl.lean"), ISORT_SPEC_IMPL),
+            (format!("lean/{pkg}/Spec/Defs.lean"), ISORT_SPEC_DEFS),
+            (format!("lean/{pkg}/Spec/Mutants.lean"), ISORT_SPEC_MUTANTS),
+            (format!("lean/{pkg}/Spec/Tests.lean"), ISORT_SPEC_TESTS),
+            (format!("lean/{pkg}/Challenge.lean"), ISORT_CHALLENGE),
         ] {
-            let p = camp.root.join(rel);
-            fs::write(&p, content).map_err(|e| VdashError::io_path(&p, e))?;
+            let p = camp.root.join(&rel);
+            fs::write(&p, rewrite_isort_package(content, &pkg))
+                .map_err(|e| VdashError::io_path(&p, e))?;
         }
     }
 
     let id = generate_campaign_id()?;
     let mut toml_text = format!(
-        "id = \"{id}\"\nhost_project = \"{}\"\n",
+        "id = \"{id}\"\nhost_project = \"{}\"\npackage = \"{pkg}\"\n",
         abs_host.display().to_string().replace('\\', "\\\\").replace('"', "\\\"")
     );
     if is_isort {
@@ -724,6 +787,94 @@ pub fn doctor(cfg: &Config) -> (String, bool) {
 }
 
 impl Ctx {
+    pub fn pkg(&self) -> &str {
+        &self.cfg.package
+    }
+
+    pub fn pkg_dir(&self) -> PathBuf {
+        self.campaign.pkg_dir(self.pkg())
+    }
+
+    pub fn lean_spec_dir(&self) -> PathBuf {
+        self.campaign.lean_spec_dir_for(self.pkg())
+    }
+
+    pub fn challenge_file(&self) -> PathBuf {
+        self.campaign.challenge_file_for(self.pkg())
+    }
+
+    pub fn solution_file(&self) -> PathBuf {
+        self.campaign.solution_file_for(self.pkg())
+    }
+
+    pub fn proof_dir(&self) -> PathBuf {
+        self.campaign.proof_dir_for(self.pkg())
+    }
+
+    pub fn proof_lib_dir(&self) -> PathBuf {
+        self.campaign.proof_lib_dir_for(self.pkg())
+    }
+
+    pub fn proof_work_dir(&self) -> PathBuf {
+        self.campaign.proof_work_dir_for(self.pkg())
+    }
+
+    pub fn trusted_files(&self) -> Vec<PathBuf> {
+        self.campaign.trusted_files_for(self.pkg())
+    }
+
+    pub fn pkg_mod_prefix(&self) -> String {
+        format!("{}.", self.pkg())
+    }
+
+    pub fn spec_mod_prefix(&self) -> String {
+        format!("{}.Spec.", self.pkg())
+    }
+
+    pub fn proof_mod_prefix(&self) -> String {
+        format!("{}.Proof.", self.pkg())
+    }
+
+    pub fn challenge_mod(&self) -> String {
+        format!("{}.Challenge", self.pkg())
+    }
+
+    pub fn solution_mod(&self) -> String {
+        format!("{}.Solution", self.pkg())
+    }
+
+    pub fn challenge_rel(&self) -> String {
+        format!("lean/{}/Challenge.lean", self.pkg())
+    }
+
+    pub fn solution_rel(&self) -> String {
+        format!("lean/{}/Solution.lean", self.pkg())
+    }
+
+    pub fn spec_rel_prefix(&self) -> String {
+        format!("lean/{}/Spec/", self.pkg())
+    }
+
+    pub fn proof_rel_prefix(&self) -> String {
+        format!("lean/{}/Proof/", self.pkg())
+    }
+
+    pub fn proof_lib_rel_prefix(&self) -> String {
+        format!("lean/{}/Proof/Lib/", self.pkg())
+    }
+
+    pub fn proof_work_rel_prefix(&self) -> String {
+        format!("lean/{}/Proof/Work/", self.pkg())
+    }
+
+    pub fn tree_challenge_rel(&self) -> String {
+        format!("{}/Challenge.lean", self.pkg())
+    }
+
+    pub fn tree_solution_rel(&self) -> String {
+        format!("{}/Solution.lean", self.pkg())
+    }
+
     pub fn for_test(campaign_dir: impl AsRef<Path>, state_dir: impl AsRef<Path>) -> Result<Self> {
         let campaign = Campaign::new(campaign_dir.as_ref());
         let cfg = config::load(&campaign.root)?;

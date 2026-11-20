@@ -420,7 +420,7 @@ fn side(f: &mut Frame, area: Rect, app: &App, ui: &Ui, p: &Palette) {
     let start = targets_window(&oks, rows);
     let below = oks.len().saturating_sub(start + rows);
     for (name, (ok, reasons)) in app.targets.iter().skip(start).take(rows.max(1)) {
-        let short = name.strip_prefix("Apc.").unwrap_or(name);
+        let short = name.split_once('.').map(|(_, rest)| rest).unwrap_or(name);
         let mut spans = vec![if *ok {
             Span::styled("✓ ", Style::default().fg(p.good).add_modifier(Modifier::BOLD))
         } else {

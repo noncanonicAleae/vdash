@@ -5,8 +5,8 @@ You review a draft Lean specification from a skeptical point of view, through on
 lens named in the prompt. A flaw you miss weakens every theorem proved from it.
 
 ## You may
-- Read every file in the campaign, in particular `sources/`, `lean/Apc/Spec/`,
-  `lean/Apc/Challenge.lean` and `spec/DEPARTURES.md`.
+- Read every file in the campaign, in particular `sources/`, `lean/{{package}}/Spec/`,
+  `lean/{{package}}/Challenge.lean` and `spec/DEPARTURES.md`.
 
 ## You must not
 - Edit any file.

@@ -165,7 +165,7 @@ fn collect_spec_context(ctx: &Ctx) -> String {
         }
         out.push('\n');
     }
-    for rel in ctx.campaign.trusted_files() {
+    for rel in ctx.trusted_files() {
         let full = ctx.campaign.root.join(&rel);
         if let Ok(text) = fs::read_to_string(&full) {
             out.push_str(&format!("### {}\n", rel.display()));
@@ -180,7 +180,7 @@ fn collect_spec_context(ctx: &Ctx) -> String {
 }
 
 fn build_trusted_tree(ctx: &Ctx) -> (bool, String) {
-    let trusted_files = ctx.campaign.trusted_files();
+    let trusted_files = ctx.trusted_files();
     if trusted_files.is_empty() {
         return (false, "FAILED: no trusted Lean files found".to_string());
     }
@@ -476,18 +476,24 @@ fn run_spec_writer(ctx: &Ctx, pool: &Pool, feedback: Option<&str>, own_lock: boo
 
     let snap = policy::snapshot(ctx);
 
+    let spec_pfx = ctx.spec_rel_prefix();
+    let chal_rel = ctx.challenge_rel();
     let mut req = if feedback.is_some() {
         Request::new(
             Role::SpecWriter,
             Reply::SpecWriter,
-            "Revise the Lean 4 specification in lean/Apc/Spec/**, lean/Apc/Challenge.lean, and spec/DEPARTURES.md based on the latest review and user feedback.",
+            format!(
+                "Revise the Lean 4 specification in {spec_pfx}**, {chal_rel}, and spec/DEPARTURES.md based on the latest review and user feedback."
+            ),
         )
         .label("revise")
     } else {
         Request::new(
             Role::SpecWriter,
             Reply::SpecWriter,
-            "Draft the initial Lean 4 specification in lean/Apc/Spec/**, lean/Apc/Challenge.lean, and spec/DEPARTURES.md from sources/BRIEF.md.",
+            format!(
+                "Draft the initial Lean 4 specification in {spec_pfx}**, {chal_rel}, and spec/DEPARTURES.md from sources/BRIEF.md."
+            ),
         )
         .label("draft")
     };
@@ -507,8 +513,8 @@ fn run_spec_writer(ctx: &Ctx, pool: &Pool, feedback: Option<&str>, own_lock: boo
     let (_, writer_outcome) = agents::run(ctx, pool, 0, req)?;
 
     let allowed = BTreeSet::from([
-        "lean/Apc/Spec/".to_string(),
-        "lean/Apc/Challenge.lean".to_string(),
+        spec_pfx,
+        chal_rel,
         "spec/DEPARTURES.md".to_string(),
     ]);
     let violations = policy::enforce(ctx, &snap, Scope::Spec, &allowed)?;

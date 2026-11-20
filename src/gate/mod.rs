@@ -172,9 +172,9 @@ fn expected_lc_marker(olean_path: &Path, module_key: &str) -> Option<String> {
     Some(format!("{module_key} {}\n", sha256_hex_bytes(&bytes)))
 }
 
-fn prune_stale_build_files(build_dir: &Path, keep_modules: &BTreeSet<String>) {
-    let apc_dir = build_dir.join("Apc");
-    if !apc_dir.is_dir() {
+fn prune_stale_build_files(build_dir: &Path, pkg: &str, keep_modules: &BTreeSet<String>) {
+    let pkg_dir = build_dir.join(pkg);
+    if !pkg_dir.is_dir() {
         return;
     }
     let suffixes = [
@@ -184,7 +184,7 @@ fn prune_stale_build_files(build_dir: &Path, keep_modules: &BTreeSet<String>) {
         ".olean.lock",
         ".olean",
     ];
-    for entry in WalkDir::new(&apc_dir).follow_links(false).into_iter().flatten() {
+    for entry in WalkDir::new(&pkg_dir).follow_links(false).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -250,6 +250,8 @@ pub fn input_digest(ctx: &Ctx) -> Result<String> {
     hasher.update(b"gate-input-v1\n");
     hasher.update(ctx.cfg.id.as_bytes());
     hasher.update(b"\0");
+    hasher.update(ctx.pkg().as_bytes());
+    hasher.update(b"\0");
     hasher.update([u8::from(ctx.cfg.use_mathlib)]);
     hasher.update([u8::from(ctx.cfg.policy.kernel_recheck)]);
     hasher.update(ctx.cfg.policy.comparator_cmd.as_bytes());
@@ -276,15 +278,17 @@ pub fn input_digest(ctx: &Ctx) -> Result<String> {
     hash_dir_files(&mut hasher, b"amendments:\n", &ctx.campaign.amendments_dir());
 
     let lean_dir = ctx.campaign.lean_dir();
-    if !ctx.campaign.solution_file().is_file() {
+    if !ctx.solution_file().is_file() {
         hasher.update(b"sol:missing\n");
     } else {
-        let mut scan = lean::imports::scan_imports(&lean_dir)?;
-        // `gate::run` copies `lean/` without `Apc/Challenge.lean`, so remove it
-        // from the import graph before computing `Apc.Solution`'s closure.
-        scan.graph.remove("Apc.Challenge");
-        scan.rel_paths.remove("Apc.Challenge");
-        let sol_target = ["Apc.Solution".to_string()];
+        let mut scan = lean::imports::scan_imports_pkg(&lean_dir, ctx.pkg())?;
+        let chal_mod = ctx.challenge_mod();
+        let sol_mod = ctx.solution_mod();
+        // `gate::run` copies `lean/` without `<Pkg>/Challenge.lean`, so remove it
+        // from the import graph before computing `<Pkg>.Solution`'s closure.
+        scan.graph.remove(&chal_mod);
+        scan.rel_paths.remove(&chal_mod);
+        let sol_target = [sol_mod];
         let closure = lean::imports::closure_of(&scan.graph, &sol_target);
         hasher.update(b"sol_closure:\n");
         for m in closure {
@@ -382,7 +386,7 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
             let chal_targets = if need_chal_build {
                 None
             } else {
-                Some(vec!["Apc.Challenge".to_string()])
+                Some(vec![ctx.challenge_mod()])
             };
             let chal_rep = lean::build::build(ctx, &chal_tree, &chal_build, chal_targets.as_deref())
                 .map_err(|e| VdashError::new(5, format!("challenge build failed: {}", e.message)))?;
@@ -394,7 +398,7 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
             }
             if !fresh && need_chal_build {
                 let keep: BTreeSet<String> = chal_rep.results.keys().cloned().collect();
-                prune_stale_build_files(&chal_build, &keep);
+                prune_stale_build_files(&chal_build, ctx.pkg(), &keep);
             }
             if let Some(fps) = maybe_fps {
                 fps
@@ -412,7 +416,7 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
     };
     let target_names: Vec<String> = chal_fps.keys().cloned().collect();
 
-    // Step 1b + 2b: Copy solution tree (without Apc/Challenge.lean) and build Apc.Solution closure.
+    // Step 1b + 2b: Copy solution tree (without <Pkg>/Challenge.lean) and build <Pkg>.Solution closure.
     let sol_tree = tmp.path().join("sol_tree");
     let sol_build = if fresh {
         tmp.path().join("sol_build")
@@ -420,21 +424,23 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
         cache_root.join("sol_build")
     };
     fs::create_dir_all(&sol_build).map_err(|e| VdashError::io_path(&sol_build, e))?;
+    let tree_chal_rel = ctx.tree_challenge_rel();
     util::copy_tree(&ctx.campaign.lean_dir(), &sol_tree, &|rel| {
-        rel == Path::new("Apc/Challenge.lean")
+        rel == Path::new(&tree_chal_rel)
     })?;
 
-    if !sol_tree.join("Apc/Solution.lean").is_file() {
+    if !sol_tree.join(ctx.tree_solution_rel()).is_file() {
         return Ok(reject_all(
             target_names,
             ReasonCode::BuildFailed,
-            serde_json::json!({ "error": "missing lean/Apc/Solution.lean" }),
+            serde_json::json!({ "error": format!("missing {}", ctx.solution_rel()) }),
             true,
             vec!["build_failed".to_string()],
         ));
     }
 
-    let sol_target = ["Apc.Solution".to_string()];
+    let sol_mod = ctx.solution_mod();
+    let sol_target = [sol_mod.clone()];
     let (sol_rep, sol_keys) =
         match lean::build::build_with_keys(ctx, &sol_tree, &sol_build, Some(&sol_target)) {
             Ok(r) => r,
@@ -470,20 +476,21 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
 
     // Step 3: scan hits on untrusted modules in the solution's import closure.
     // A module in the solution closure counts as trusted ONLY if it starts with
-    // `Apc.Spec.` AND a file with the same relative path exists in `.heldout/lean/`
+    // `<Pkg>.Spec.` AND a file with the same relative path exists in `.heldout/lean/`
     // with identical bytes.
     // Only the solution's own closure matters; a broken import elsewhere must not fail the gate.
-    let sol_graph = lean::imports::scan_imports(&sol_tree)?.graph;
+    let sol_graph = lean::imports::scan_imports_pkg(&sol_tree, ctx.pkg())?.graph;
     let sol_closure = lean::imports::closure_of(&sol_graph, &sol_target);
     if !fresh {
-        prune_stale_build_files(&sol_build, &sol_closure);
+        prune_stale_build_files(&sol_build, ctx.pkg(), &sol_closure);
     }
 
     let heldout_tree = ctx.campaign.heldout_tree();
+    let spec_prefix = ctx.spec_mod_prefix();
     let untrusted_mods: Vec<String> = sol_closure
         .into_iter()
         .filter(|m| {
-            if !m.starts_with("Apc.Spec.") {
+            if !m.starts_with(&spec_prefix) {
                 return true;
             }
             let mut rel = PathBuf::new();
@@ -598,11 +605,11 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
         }
     }
 
-    // Step 5: Fingerprint solution for the challenge target names (root Apc.Solution),
-    // reusing `sol_fps.json` when `Apc.Solution`'s build key and `target_names` match.
+    // Step 5: Fingerprint solution for the challenge target names (root <Pkg>.Solution),
+    // reusing `sol_fps.json` when `<Pkg>.Solution`'s build key and `target_names` match.
     let sol_fps_path = cache_root.join("sol_fps.json");
     let sol_fps = if !fresh {
-        let cached = sol_keys.get("Apc.Solution").and_then(|sk| {
+        let cached = sol_keys.get(&sol_mod).and_then(|sk| {
             jsonio::read_json::<CachedSolFps>(&sol_fps_path)
                 .ok()
                 .filter(|c| c.version == 1 && &c.sol_key == sk && c.target_names == target_names)
@@ -612,8 +619,8 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
             Some(fps) => fps,
             None => {
                 let fps =
-                    fingerprint::closure(ctx, &sol_tree, &sol_build, "Apc.Solution", &target_names)?;
-                if let Some(sk) = sol_keys.get("Apc.Solution") {
+                    fingerprint::closure(ctx, &sol_tree, &sol_build, &sol_mod, &target_names)?;
+                if let Some(sk) = sol_keys.get(&sol_mod) {
                     let cached_entry = CachedSolFps {
                         version: 1,
                         sol_key: sk.clone(),
@@ -626,7 +633,7 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
             }
         }
     } else {
-        fingerprint::closure(ctx, &sol_tree, &sol_build, "Apc.Solution", &target_names)?
+        fingerprint::closure(ctx, &sol_tree, &sol_build, &sol_mod, &target_names)?
     };
 
     // Step 7 check (optional comparator_cmd)
@@ -694,8 +701,13 @@ pub fn run_with_opts(ctx: &Ctx, fresh: bool) -> Result<Verdict> {
                 }
 
                 let mut untrusted = Vec::new();
+                let spec_mod = format!("{}.Spec", ctx.pkg());
                 for (cname, ce) in &s_tfp.closure {
-                    if !ce.ext && !ce.module.starts_with("Apc.Spec") && untrusted.len() < 10 {
+                    if !ce.ext
+                        && ce.module != spec_mod
+                        && !ce.module.starts_with(&spec_prefix)
+                        && untrusted.len() < 10
+                    {
                         untrusted.push(cname.clone());
                     }
                 }

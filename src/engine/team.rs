@@ -25,8 +25,8 @@ use crate::util;
 // ------------------------------------------------------------------ helpers
 
 fn challenge_text(ctx: &Ctx) -> String {
-    fs::read_to_string(ctx.campaign.heldout_tree().join("Apc/Challenge.lean"))
-        .or_else(|_| fs::read_to_string(ctx.campaign.challenge_file()))
+    fs::read_to_string(ctx.campaign.heldout_tree().join(ctx.tree_challenge_rel()))
+        .or_else(|_| fs::read_to_string(ctx.challenge_file()))
         .unwrap_or_default()
 }
 
@@ -111,11 +111,11 @@ fn verified_lemmas(eng: &Engine, plan: &Plan) -> String {
         .join("\n")
 }
 
-/// The `Apc.*` import graph for agent prompts, tagged with the goals that own each
-/// module, whether `Apc.Solution` reaches it, and orphans (Proof files no goal owns).
+/// The `<Pkg>.*` import graph for agent prompts, tagged with the goals that own each
+/// module, whether `<Pkg>.Solution` reaches it, and orphans (Proof files no goal owns).
 fn import_graph_text(eng: &Engine, plan: &Plan) -> String {
     let tree = eng.ctx.campaign.lean_dir();
-    let Ok(scan) = lean::imports::scan_imports(&tree) else { return String::new() };
+    let Ok(scan) = lean::imports::scan_imports_pkg(&tree, eng.ctx.pkg()) else { return String::new() };
     let st = eng.state().ok();
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for g in &plan.goals {
@@ -124,13 +124,15 @@ fn import_graph_text(eng: &Engine, plan: &Plan) -> String {
             owners.entry(m).or_default().push(format!("{}:{status}", g.id));
         }
     }
-    let reach = lean::imports::closure_of(&scan.graph, &["Apc.Solution".to_string()]);
+    let sol_mod = eng.ctx.solution_mod();
+    let proof_pfx = eng.ctx.proof_mod_prefix();
+    let reach = lean::imports::closure_of(&scan.graph, &[sol_mod]);
     let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for m in scan.graph.keys() {
         let t = tags.entry(m.clone()).or_default();
         if let Some(o) = owners.get(m) {
             t.push(format!("goal {}", o.join(" ")));
-        } else if m.starts_with("Apc.Proof.") {
+        } else if m.starts_with(&proof_pfx) {
             t.push("ORPHAN: no goal owns this file".into());
         }
         if reach.contains(m) {
@@ -180,18 +182,20 @@ pub fn declared_names(src: &str) -> Vec<String> {
     out
 }
 
-/// The proof library at a glance for the integrator: every `Apc.Proof.*` module
-/// and `Apc.Solution`, with its line count, `Apc.*` imports and declarations, so it
+/// The proof library at a glance for the integrator: every `<Pkg>.Proof.*` module
+/// and `<Pkg>.Solution`, with its line count, `<Pkg>.*` imports and declarations, so it
 /// reads only the files it changes instead of exploring the tree.
 fn library_map(ctx: &Ctx) -> String {
     let tree = ctx.campaign.lean_dir();
-    let Ok(scan) = lean::imports::scan_imports(&tree) else { return String::new() };
+    let Ok(scan) = lean::imports::scan_imports_pkg(&tree, ctx.pkg()) else { return String::new() };
+    let proof_pfx = ctx.proof_mod_prefix();
+    let sol_mod = ctx.solution_mod();
     // agy takes at most 100 KB of prompt (fact A3); past this budget a file is
     // listed by path and size only.
     const BUDGET: usize = 24_000;
     let mut out = String::new();
     for (m, deps) in &scan.graph {
-        if !(m.starts_with("Apc.Proof.") || m == "Apc.Solution") {
+        if !(m.starts_with(&proof_pfx) || m == &sol_mod) {
             continue;
         }
         let Some(rel) = scan.rel_paths.get(m) else { continue };
@@ -220,8 +224,10 @@ fn library_map(ctx: &Ctx) -> String {
 /// done goals (proved and still building, or accepted targets): what they once
 /// depended on is no longer needed. `broken` goals count as not done.
 fn needed_goals(eng: &Engine, plan: &Plan, st: &crate::paths::State, broken: &BTreeSet<String>) -> BTreeSet<String> {
-    let reach = lean::imports::scan_imports(&eng.ctx.campaign.lean_dir())
-        .map(|s| lean::imports::closure_of(&s.graph, &["Apc.Solution".to_string()]))
+    let sol_mod = eng.ctx.solution_mod();
+    let pkg_pfx = eng.ctx.pkg_mod_prefix();
+    let reach = lean::imports::scan_imports_pkg(&eng.ctx.campaign.lean_dir(), eng.ctx.pkg())
+        .map(|s| lean::imports::closure_of(&s.graph, &[sol_mod]))
         .unwrap_or_default();
     let done = |g: &Goal| {
         if broken.contains(&g.id) {
@@ -243,7 +249,7 @@ fn needed_goals(eng: &Engine, plan: &Plan, st: &crate::paths::State, broken: &BT
     // any `depends_on` edge or import reaches it: it may be a fresh lemma.
     let unaccepted_target = |pt: &str| {
         plan.goals.iter().filter(|t| t.kind == "target").any(|t| {
-            (t.id == pt || t.lean_name == pt || t.lean_name.strip_prefix("Apc.") == Some(pt)) && !done(t)
+            (t.id == pt || t.lean_name == pt || t.lean_name.strip_prefix(&pkg_pfx) == Some(pt)) && !done(t)
         })
     };
     let mut stack: Vec<&Goal> = plan
@@ -365,13 +371,14 @@ fn retire_unneeded(eng: &Engine, round: u32, plan: &Plan, broken: &BTreeSet<Stri
 /// module it imports is fine (so the repair addresses a root cause).
 fn adopt_orphans(eng: &Engine, round: u32, plan: Plan) -> Result<Plan> {
     let tree = eng.ctx.campaign.lean_dir();
-    let scan = lean::imports::scan_imports(&tree)?;
+    let scan = lean::imports::scan_imports_pkg(&tree, eng.ctx.pkg())?;
     let owned: BTreeSet<String> = plan.goals.iter().filter(|g| g.kind != "repair").filter_map(|g| eng.ctx.campaign.module_name(&g.file).ok()).collect();
     let mut roots: Vec<String> = owned.iter().filter(|m| scan.graph.contains_key(*m)).cloned().collect();
-    roots.push("Apc.Solution".into());
+    roots.push(eng.ctx.solution_mod());
     roots.retain(|m| scan.graph.contains_key(m));
     let reach = lean::imports::closure_of(&scan.graph, &roots);
-    let candidates: Vec<String> = reach.iter().filter(|m| m.starts_with("Apc.Proof.") && !owned.contains(*m)).cloned().collect();
+    let proof_pfx = eng.ctx.proof_mod_prefix();
+    let candidates: Vec<String> = reach.iter().filter(|m| m.starts_with(&proof_pfx) && !owned.contains(*m)).cloned().collect();
     let mut repairs = Vec::new();
     if !candidates.is_empty() {
         // Build each root separately in parallel: one broken root must not hide the others' results.
@@ -498,7 +505,7 @@ fn build_checked(ctx: &Ctx, file: &str, named: bool) -> std::result::Result<(Str
     if !rep.ok {
         return Err(format!("{file} does not build"));
     }
-    if (file != "lean/Apc/Solution.lean" || !named)
+    if (file != ctx.solution_rel() || !named)
         && rep.results.get(&module).is_some_and(|r| r.diagnostics.iter().any(|d| d.kind == "hasSorry"))
     {
         return Err(format!("{file} still contains sorry"));
@@ -768,7 +775,7 @@ pub fn run_worker_checked_with<'a>(
 
 fn trusted_unchanged(eng: &Engine) -> bool {
     let Some(snap) = &eng.snap else { return false };
-    eng.ctx.campaign.trusted_files().iter().all(|rel| {
+    eng.ctx.trusted_files().iter().all(|rel| {
         let key = rel.to_string_lossy().replace('\\', "/");
         let now = fs::read(eng.ctx.campaign.root.join(rel)).ok();
         snap.bytes(&key).map(|b| b.to_vec()) == now
@@ -785,6 +792,7 @@ pub fn open_escalations_text(ctx: &Ctx) -> String {
 
 fn fallback_plan(eng: &Engine, revision: u32) -> Plan {
     let st = eng.state().ok();
+    let sol_rel = eng.ctx.solution_rel();
     let goals = st
         .map(|s| s.targets.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default()
@@ -795,7 +803,7 @@ fn fallback_plan(eng: &Engine, revision: u32) -> Plan {
             kind: "target".into(),
             lean_name: t.clone(),
             statement: format!("(the statement of {t} in Challenge.lean)"),
-            file: "lean/Apc/Solution.lean".into(),
+            file: sol_rel.clone(),
             depends_on: vec![],
             parent_target: t,
         })
@@ -816,11 +824,12 @@ pub fn plan(eng: &mut Engine, round: u32) -> Result<()> {
     let st = eng.state()?;
     let rev = old.as_ref().map(|p| p.revision + 1).unwrap_or(1);
     let strategy = fs::read_to_string(eng.ctx.campaign.strategy_file()).unwrap_or_default();
+    let sol_rel = eng.ctx.solution_rel();
     let base = Request::new(
         Role::Architect,
         Reply::Architect,
         format!(
-            "Design the goal decomposition for this campaign (plan revision {rev}). Every target theorem in Challenge.lean needs exactly one goal of kind target in lean/Apc/Solution.lean. Keep proved goals unchanged."
+            "Design the goal decomposition for this campaign (plan revision {rev}). Every target theorem in Challenge.lean needs exactly one goal of kind target in {sol_rel}. Keep proved goals unchanged."
         ),
     )
     .section("challenge", challenge_text(&eng.ctx))
@@ -833,7 +842,7 @@ pub fn plan(eng: &mut Engine, round: u32) -> Result<()> {
     let (_, out) = agents::run(&eng.ctx, eng.pool, round, base)?;
     let mut goals = out.ok().and_then(parse_goals);
     if let Some(g) = &goals {
-        let errs = plan::validate(g, &st);
+        let errs = plan::validate(eng.ctx.pkg(), g, &st);
         if !errs.is_empty() {
             // One repair call with the validation errors.
             let fix = Request::new(Role::Architect, Reply::Architect, "Your plan was rejected. Fix every error listed and reply with the complete corrected plan.")
@@ -842,7 +851,7 @@ pub fn plan(eng: &mut Engine, round: u32) -> Result<()> {
                 .section("errors", errs.join("\n"))
                 .label("plan");
             let (_, out2) = agents::run(&eng.ctx, eng.pool, round, fix)?;
-            goals = out2.ok().and_then(parse_goals).filter(|g2| plan::validate(g2, &st).is_empty());
+            goals = out2.ok().and_then(parse_goals).filter(|g2| plan::validate(eng.ctx.pkg(), g2, &st).is_empty());
         }
     }
     let new_plan = match goals {
@@ -995,7 +1004,7 @@ pub fn leads(eng: &mut Engine, round: u32) -> Result<()> {
         eng.snap = Some(policy::snapshot(&eng.ctx));
     }
     // Warm the build cache for the spec so workers' checks start fast.
-    let _ = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&["Apc.Challenge".to_string()]));
+    let _ = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&[eng.ctx.challenge_mod()]));
     let prev_allowed: BTreeSet<String> = serde_json::from_value(rd(eng, &["allowed"])).unwrap_or_default();
     let sh = Shared { claimed: Mutex::new(resumed_claims(&rd(eng, &["claims"]), &done)), allowed: Mutex::new(prev_allowed) };
     let plan = load_plan(&eng.ctx).unwrap_or_else(|| fallback_plan(eng, 1));
@@ -1059,7 +1068,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
             .iter()
             .filter_map(|gid| plan.goal(gid).map(|g| (gid, g)))
             .filter_map(|(gid, g)| {
-                let file = format!("lean/Apc/Proof/Work/Refute_{}.lean", slug(gid));
+                let file = format!("{}Refute_{}.lean", ctx.proof_work_rel_prefix(), slug(gid));
                 if !claim(sh, id, &file) {
                     return None;
                 }
@@ -1113,7 +1122,7 @@ fn run_lead(eng: &Engine, round: u32, lead: &LeadAssign, plan: &Plan, sh: &Share
         if let Some(g) = plan.goal(&goal).filter(|g| g.kind == "repair") {
             file = g.file.clone();
         }
-        if !mine.contains(&goal) || refuted.contains(&goal) || !plan::valid_file(&file) {
+        if !mine.contains(&goal) || refuted.contains(&goal) || !plan::valid_file(ctx.pkg(), &file) {
             continue;
         }
         asgs.push(Asg {
@@ -1428,10 +1437,15 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
     }
     let Some(plan) = load_plan(&eng.ctx) else { return Ok(()) };
     let st = eng.state()?;
+    let work_pfx = eng.ctx.proof_work_rel_prefix();
+    let lib_pfx = eng.ctx.proof_lib_rel_prefix();
+    let sol_rel = eng.ctx.solution_rel();
+    let sol_mod = eng.ctx.solution_mod();
+    let proof_mod_pfx = format!("{}.Proof", eng.ctx.pkg());
     let work: Vec<&Goal> = plan
         .goals
         .iter()
-        .filter(|g| matches!(g.kind.as_str(), "lemma" | "witness") && g.file.starts_with("lean/Apc/Proof/Work/") && st.goals.get(&g.id).is_some_and(|x| x.status == "proved"))
+        .filter(|g| matches!(g.kind.as_str(), "lemma" | "witness") && g.file.starts_with(&work_pfx) && st.goals.get(&g.id).is_some_and(|x| x.status == "proved"))
         .collect();
     if work.is_empty() {
         return Ok(());
@@ -1439,7 +1453,7 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
     // The integrator starts from the engine's own check of the solution (M8-07), so
     // it does not spend its first turn trying to run one.
     let (before_ok, solution_check) =
-        match lean::build::check_file_report(&eng.ctx, std::path::Path::new("lean/Apc/Solution.lean"), &eng.ctx.campaign.root) {
+        match lean::build::check_file_report(&eng.ctx, std::path::Path::new(&sol_rel), &eng.ctx.campaign.root) {
             Ok((report, ok, r)) => {
                 record_module_times(&eng.ctx, &r);
                 (ok, report)
@@ -1448,20 +1462,19 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
         };
     let st = eng.state()?;
     let snap = policy::snapshot(&eng.ctx);
-    let mut slow: Vec<(&String, &f64)> = st.module_times.iter().filter(|(m, _)| m.starts_with("Apc.Proof")).collect();
+    let mut slow: Vec<(&String, &f64)> = st.module_times.iter().filter(|(m, _)| m.starts_with(&proof_mod_pfx)).collect();
     slow.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let req = Request::new(Role::Integrator, Reply::Integrator, "Move the verified lemmas below into lean/Apc/Proof/Lib/, remove duplicates, and keep every file building.")
+    let req = Request::new(Role::Integrator, Reply::Integrator, format!("Move the verified lemmas below into {lib_pfx}, remove duplicates, and keep every file building."))
         .section("verified_lemmas", work.iter().map(|g| format!("{} in {}: {}", g.lean_name, g.file, g.statement)).collect::<Vec<_>>().join("\n"))
         .section("library_map", library_map(&eng.ctx))
         .section("slow_modules", slow.iter().take(5).map(|(m, t)| format!("{m}: {t:.1}s")).collect::<Vec<_>>().join("\n"))
-        .section("solution_check", format!("`vdash check lean/Apc/Solution.lean`, run by the engine just now:\n{solution_check}"))
+        .section("solution_check", format!("`vdash check {sol_rel}`, run by the engine just now:\n{solution_check}"))
         .label("integrate");
     let (_, out) = agents::run(&eng.ctx, eng.pool, round, req)?;
-    let allowed: BTreeSet<String> =
-        ["lean/Apc/Proof/Lib/", "lean/Apc/Proof/Work/", "lean/Apc/Solution.lean"].iter().map(|s| s.to_string()).collect();
+    let allowed: BTreeSet<String> = [lib_pfx, work_pfx, sol_rel].into_iter().collect();
     let vs = policy::enforce(&eng.ctx, &snap, Scope::Proof, &allowed)?;
     policy::report(&eng.ctx, round, &vs);
-    let after_ok = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&["Apc.Solution".to_string()]))
+    let after_ok = lean::build::build(&eng.ctx, &eng.ctx.campaign.lean_dir(), &eng.ctx.campaign.build_work_dir(), Some(&[sol_mod]))
         .map(|r| {
             record_module_times(&eng.ctx, &r);
             r.ok
@@ -1523,7 +1536,7 @@ pub fn integrate(eng: &mut Engine, round: u32) -> Result<()> {
                     .map(|g| {
                         let mut g = g.clone();
                         if let Some(f) = moved.get(&g.lean_name) {
-                            if plan::valid_file(f) {
+                            if plan::valid_file(eng.ctx.pkg(), f) {
                                 g.file = f.clone();
                             }
                         }

@@ -1,8 +1,8 @@
-import Apc.Spec.Impl
-import Apc.Spec.Defs
-import Apc.Spec.Mutants
+import Isort.Spec.Impl
+import Isort.Spec.Defs
+import Isort.Spec.Mutants
 
-namespace Apc
+namespace Isort
 
 private theorem insert_perm (x : Nat) : ∀ l : List Nat, (Spec.insert x l).Perm (x :: l)
   | [] => List.Perm.refl [x]
@@ -84,4 +84,4 @@ theorem isortBad_incorrect : ¬ Spec.Correct Spec.isortBad := by
   revert hlen
   decide
 
-end Apc
+end Isort

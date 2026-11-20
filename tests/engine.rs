@@ -42,7 +42,7 @@ fn single_worker_with_reference_solution_finishes_in_one_round() {
     let fb = Arc::new(FakeBackend::new(BackendKind::Claude));
     let root = ctx.campaign.root.clone();
     fb.func(Role::Worker, move |_call| {
-        fs::write(root.join("lean/Apc/Solution.lean"), paths::ISORT_REFERENCE_SOLUTION).unwrap();
+        fs::write(root.join("lean/Apc/Solution.lean"), paths::isort_reference_solution("Apc")).unwrap();
         worker_reply("all", &TARGETS)
     });
     let pool = Pool::new(&ctx, vec![fb.clone()]);
@@ -65,7 +65,7 @@ fn spec_edit_by_worker_is_reverted_and_gate_decides() {
     let defs_before = fs::read_to_string(root.join("lean/Apc/Spec/Defs.lean")).unwrap();
     let r2 = root.clone();
     fb.func(Role::Worker, move |_call| {
-        fs::write(r2.join("lean/Apc/Solution.lean"), paths::ISORT_REFERENCE_SOLUTION).unwrap();
+        fs::write(r2.join("lean/Apc/Solution.lean"), paths::isort_reference_solution("Apc")).unwrap();
         // Weaken the spec: every list counts as sorted.
         fs::write(r2.join("lean/Apc/Spec/Defs.lean"), "import Apc.Spec.Impl\nnamespace Apc.Spec\ndef Sorted (_ : List Nat) : Prop := True\ndef Correct (f : List Nat → List Nat) : Prop := ∀ l, Sorted (f l) ∧ (f l).Perm l\nend Apc.Spec\n").unwrap();
         worker_reply("all", &TARGETS)
@@ -116,7 +116,7 @@ fn team_round_with_both_backends_reaches_done() {
     claude.reply(Role::TeamLead, json!({"summary": "all four restated and proved in Solution.lean (claimed)", "goal_status": {"t1": "claimed"}, "notes": "round 1 done", "bulletin": ["Solution.lean holds every target"], "amendments": [], "escalations": []}));
     let root = ctx.campaign.root.clone();
     let worker = move |_call: &vdash::backend::AgentCall| {
-        fs::write(root.join("lean/Apc/Solution.lean"), paths::ISORT_REFERENCE_SOLUTION).unwrap();
+        fs::write(root.join("lean/Apc/Solution.lean"), paths::isort_reference_solution("Apc")).unwrap();
         worker_reply("t1", &["Apc.isort_correct"])
     };
     claude.func(Role::Worker, worker.clone());
@@ -142,7 +142,7 @@ fn resume_after_crash_skips_finished_stages() {
     let tmp = TempDir::new().unwrap();
     let ctx = approved_isort(&tmp);
     // Simulate a crash after the leads stage of round 1: the worker's file is in place.
-    fs::write(ctx.campaign.solution_file(), paths::ISORT_REFERENCE_SOLUTION).unwrap();
+    fs::write(ctx.campaign.solution_file(), paths::isort_reference_solution("Apc")).unwrap();
     vdash::util::update_state(&ctx.campaign, |s| {
         s.phase = "proving".into();
         s.round = 1;
@@ -465,7 +465,7 @@ fn engine_in_memory_gate_cache_handles_unchanged_and_changed_rounds() {
     }
     fb.func(Role::Worker, move |_call| {
         // Round 2: write reference solution.
-        fs::write(root.join("lean/Apc/Solution.lean"), paths::ISORT_REFERENCE_SOLUTION).unwrap();
+        fs::write(root.join("lean/Apc/Solution.lean"), paths::isort_reference_solution("Apc")).unwrap();
         worker_reply("all", &TARGETS)
     });
     let pool = Pool::new(&ctx, vec![fb]);

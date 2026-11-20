@@ -517,7 +517,7 @@ fn build_once(
     build_dir: &Path,
     targets: Option<&[String]>,
 ) -> Result<(BuildReport, BTreeMap<String, String>)> {
-    let scan = imports::scan_imports(tree)?;
+    let scan = imports::scan_imports_pkg(tree, ctx.pkg())?;
     let graph = scope_graph_for_targets(tree, scan, targets)?;
 
     // Validates acyclicity and keeps the exact import cycle diagnostic.

@@ -32,8 +32,8 @@ Plan:
 2. Put in `refute` every goal not yet attempted whose truth you doubt (falsify first).
 3. Fix shared parameters before work fans out: if two goals need the same helper
    lemma or definition, state it once in `shared` with its exact Lean signature.
-4. Give each remaining goal one file: `lean/Apc/Proof/Work/<Topic>.lean` for lemmas,
-   `lean/Apc/Solution.lean` for top-level targets. Only **one** assignment per round
+4. Give each remaining goal one file: `lean/{{package}}/Proof/Work/<Topic>.lean` for lemmas,
+   `lean/{{package}}/Solution.lean` for top-level targets. Only **one** assignment per round
    can use `Solution.lean`; for other targets that round, assign a lemma in a Work
    file proving exactly the target's statement, which a later `Solution.lean`
    assignment then uses. Point each worker to existing lemmas that may help.
@@ -48,7 +48,7 @@ Summary:
    deviation or a progress note is not an escalation; put it in `notes`.
 
 ## Checks before replying
-- Plan: every assignment names an existing goal id and a file under `lean/Apc/`.
+- Plan: every assignment names an existing goal id and a file under `lean/{{package}}/`.
 - Summary: `summary` is under 1200 characters.
 
 ## Reply

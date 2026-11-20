@@ -132,7 +132,7 @@ pub fn run(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<(Stri
 /// [`run`], also returning the session a follow-up call can resume.
 pub fn run_full(ctx: &Ctx, pool: &Pool, round: u32, req: Request<'_>) -> Result<Ran> {
     let id = next_agent_id(ctx, req.role);
-    let skill = skills::load(&ctx.campaign, req.role)?;
+    let skill = skills::load_for(ctx, req.role)?;
     let prompt = prompts::build(&req.task, &req.sections);
     let schema = req.reply.schema().clone();
     let call = AgentCall {

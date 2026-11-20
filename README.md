@@ -89,10 +89,11 @@ vdash login gemini    # Launch interactive Gemini (agy) OAuth sign-in
 
 ### `vdash init` Syntax
 ```bash
-vdash init <CAMPAIGN_DIR> --host <HOST_LAKE_PROJECT_DIR> [--example isort]
+vdash init <CAMPAIGN_DIR> --host <HOST_LAKE_PROJECT_DIR> [--package <PACKAGE>] [--example isort]
 ```
 - `<CAMPAIGN_DIR>`: new or empty directory to create for the campaign.
 - `--host <HOST_LAKE_PROJECT_DIR>`: path to your Lean 4 Lake project containing `lean-toolchain` (and `.lake/packages/mathlib` if using Mathlib).
+- `--package <PACKAGE>` *(optional)*: UpperCamelCase Lean root package/namespace name (default: UpperCamelCase of `<CAMPAIGN_DIR>`, e.g. `my-theorem` → `MyTheorem`).
 - `--example isort` *(optional)*: populates the campaign with a complete, self-contained insertion-sort specification (`Impl.lean`, `Defs.lean`, `Mutants.lean`, `Tests.lean`, and 4 target theorems in `Challenge.lean`) so you can test the proof engine immediately.
 
 ### How `vdash` Finds Your Campaign
@@ -129,12 +130,12 @@ vdash
 1. **Provide Your Specification Brief (or PDF/Markdown Sources)**:
    - You can drop any reference papers, **PDF specifications**, notes, or code into `sources/` (e.g. `sources/spec.pdf`, `sources/notes.md`).
    - In the `vdash` TUI, simply **type what you want proved in plain English** (or reference the files in `sources/`).
-   - `vdash` saves your initial prompt as `sources/BRIEF.md`, runs the **Spec Writer** to draft `lean/Apc/Spec/*.lean` and `lean/Apc/Challenge.lean`, and automatically runs **4 parallel Reviewers** (`soundness`, `strength`, `fidelity`, `legibility`) to audit the draft.
+   - `vdash` saves your initial prompt as `sources/BRIEF.md`, runs the **Spec Writer** to draft `lean/<Package>/Spec/*.lean` and `lean/<Package>/Challenge.lean`, and automatically runs **4 parallel Reviewers** (`soundness`, `strength`, `fidelity`, `legibility`) to audit the draft.
 2. **Iterate on the Spec**:
    - Type plain-text feedback in the TUI (or `/spec <feedback>`) to have the Spec Writer revise the Lean definitions and target theorems, followed by another 4-lens review (`/review` reruns the reviewers).
    - The spec phase **loops on its own**: while any reviewer says `revise`, the Spec Writer revises against the latest review and the reviewers run again, until all four say `ok`, you say it's good enough (`/stop`, or `/approve`, which stops the loop and then approves), or `[budget] spec_max_rounds` rounds (default 10) have run. Plain text typed during the loop is queued as guidance for the next revision. CLI: `vdash spec draft|revise|review` loop too; add `--once` for a single step.
 3. **Freeze & Approve the Spec**:
-   - Once the review reports `0 blocker` findings and you are happy with `lean/Apc/Challenge.lean`, run `/approve` (or `vdash approve`).
+   - Once the review reports `0 blocker` findings and you are happy with `lean/<Package>/Challenge.lean`, run `/approve` (or `vdash approve`).
    - This verifies that `Spec/*` has no `sorry` or `axiom`, checks that every target in `Challenge.lean` has a `sorry` placeholder, records a baseline Git commit, copies the trusted spec into `.heldout/lean` (read-only), and writes a SHA-256 trust anchor outside the campaign directory (`~/.local/state/vdash/<id>/anchor.json`).
 4. **Prove the Targets**:
    - Run `/prove` in the TUI (or `vdash prove` on the CLI).
@@ -189,7 +190,7 @@ Run `vdash` with no subcommand inside a campaign to open the terminal UI.
 `/stop` is cooperative: the engine finishes the agent it is waiting on, reverts out-of-scope edits and exits. `/kill` (`vdash kill`) is for when you want everything gone now. It sends SIGTERM to the engine and to every process it started (the `claude` / `agy` calls and their children), waits up to 8 seconds, then SIGKILLs whatever is left. A round killed midway is not reverted on the spot; the next engine start snapshots the tree again, and the gatekeeper never trusts agent edits regardless.
 
 #### `/verbose`
-Agents edit Lean files in place, so by default you only see their summaries. With `/verbose` on, the transcript also shows each new line that appears in `lean/Apc/Proof/**`, the proof work directory and `Solution.lean` (at most 14 lines per file per update). Turn it off with `/verbose off` (or `/verbose` again).
+Agents edit Lean files in place, so by default you only see their summaries. With `/verbose` on, the transcript also shows each new line that appears in `lean/<Package>/Proof/**`, the proof work directory and `Solution.lean` (at most 14 lines per file per update). Turn it off with `/verbose off` (or `/verbose` again).
 
 ### Keyboard Shortcuts
 - **`Enter`**: Send command or plain-text message (or accept selected completion).
@@ -380,7 +381,7 @@ vdash [-C <DIR>] amend list | approve <N> [--accept-weakening] | reject <N> | pr
 ├── sources/                 # Your problem brief (BRIEF.md), PDFs, papers, or reference code
 ├── spec/                    # Spec review reports (review-N.md) and DEPARTURES.md
 ├── lean/
-│   └── Apc/
+│   └── <Package>/           # UpperCamelCase campaign package (e.g. MyTheorem/)
 │       ├── Spec/            # TRUSTED definitions, implementation under test, and sanity tests
 │       ├── Challenge.lean   # TRUSTED target theorems (each := by sorry)
 │       ├── Solution.lean    # UNTRUSTED top-level proof file importing Proof/ and proving targets
@@ -394,9 +395,9 @@ vdash [-C <DIR>] amend list | approve <N> [--accept-weakening] | reject <N> | pr
 ```
 
 ### How Soundness Is Enforced
-- **Trusted Computing Base (TCB)**: Only `lean/Apc/Spec/**`, `lean/Apc/Challenge.lean`, Lean 4's kernel, and `vdash`'s gatekeeper are trusted. Everything written by an agent during proving is untrusted.
+- **Trusted Computing Base (TCB)**: Only `lean/<Package>/Spec/**`, `lean/<Package>/Challenge.lean`, Lean 4's kernel, and `vdash`'s gatekeeper are trusted. Everything written by an agent during proving is untrusted.
 - **Automatic Policy Revert**: Before every agent round, `vdash` snapshots the campaign tree. Any out-of-scope file edit by a worker, falsifier, or integrator—including any attempt to touch `Spec/`, `Challenge.lean`, or `.heldout/`—is automatically reverted and logged as a violation.
-- **External Trust Anchor**: Upon `vdash approve`, the SHA-256 hashes of every trusted file and the expression-DAG fingerprints of every target theorem's full `Apc.*` constant closure are stored outside the campaign in `~/.local/state/vdash/<id>/anchor.json` (`0444`).
+- **External Trust Anchor**: Upon `vdash approve`, the SHA-256 hashes of every trusted file and the expression-DAG fingerprints of every target theorem's full `<Package>.*` constant closure are stored outside the campaign in `~/.local/state/vdash/<id>/anchor.json` (`0444`).
 - **Independent Gatekeeper (`vdash gate`)**: Rebuilds the held-out tree and solution tree in fresh temporary directories, verifies all expression-DAG fingerprints against the external anchor, scans all untrusted Lean sources for forbidden tokens (`sorry`, `admit`, `axiom`, `native_decide`, `unsafe`, `implemented_by`, `extern`, `run_cmd`, `by_elab`, `macro`, `elab`, `syntax`, `notation`, `local_notation`, `scoped`, `set_option debug.*`), checks that each target uses only standard axioms (`propext`, `Quot.sound`, `Classical.choice`), and runs `leanchecker` on the fresh environment.
 
 ---

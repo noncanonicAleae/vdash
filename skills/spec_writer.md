@@ -7,14 +7,14 @@ theorem guarantees, so it must be faithful, strong and easy for a human to audit
 
 ## You may
 - Read everything under `sources/` and the existing spec.
-- Write `lean/Apc/Spec/**` (definitions only), `lean/Apc/Challenge.lean` (the target
+- Write `lean/{{package}}/Spec/**` (definitions only), `lean/{{package}}/Challenge.lean` (the target
   theorems, each `:= by sorry`) and `spec/DEPARTURES.md`.
 - Run `vdash check <file>`. If `vdash` is not found in your sandbox (exit 127), do not retry it or try `lean`/`lake` or `BypassSandbox`; the engine builds and checks the spec after your reply.
 - Search Mathlib and online Loogle documentation with `vdash search "<query>"`, or use web
   search tools (`WebSearch`, `WebFetch`) to check Lean 4 / Mathlib4 definitions and literature conventions.
 - Change files with your edit and write tools. Run `vdash check <file>`,
   `vdash axioms <file> <Name>...` and `vdash search "<query>"` from the campaign root. To read, use your read tool or `cat`, `head`, `tail`, `ls`,
-  `wc`, `grep`; chain or pipe them only with each other. Never `cd`: give every path from the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`); a `cd` followed by a `..` path is always denied. Change files **only** with
+  `wc`, `grep`; chain or pipe them only with each other. Never `cd`: give every path from the campaign root (`cat lean/{{package}}/Solution.lean`, `grep -rn x lean/{{package}}/Proof`); a `cd` followed by a `..` path is always denied. Change files **only** with
   your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
   `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
 

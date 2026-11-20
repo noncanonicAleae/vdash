@@ -203,17 +203,18 @@ pub struct ImportScan {
     pub missing: Vec<(String, String, PathBuf)>,
 }
 
-/// Scan every `*.lean` file under `<tree>/Apc/` and collect its `Apc.*` imports
+/// Scan every `*.lean` file under `<tree>/<pkg>/` and collect its `<pkg>.*` imports
 /// without failing when an edge targets a missing module.
-pub fn scan_imports(tree: &Path) -> Result<ImportScan> {
-    let apc_dir = tree.join("Apc");
+pub fn scan_imports_pkg(tree: &Path, pkg: &str) -> Result<ImportScan> {
+    let pkg_dir = tree.join(pkg);
+    let pkg_prefix = format!("{pkg}.");
     let mut scan = ImportScan::default();
 
-    if !apc_dir.is_dir() {
+    if !pkg_dir.is_dir() {
         return Ok(scan);
     }
 
-    for entry in WalkDir::new(&apc_dir).follow_links(false) {
+    for entry in WalkDir::new(&pkg_dir).follow_links(false) {
         let entry = entry.map_err(|e| VdashError::new(2, format!("walkdir error: {e}")))?;
         if !entry.file_type().is_file() {
             continue;
@@ -228,7 +229,7 @@ pub fn scan_imports(tree: &Path) -> Result<ImportScan> {
         let mod_name = tree_rel_to_module(rel)?;
         let mut deps = Vec::new();
         for imp in read_imports_header(path)? {
-            if imp.starts_with("Apc.") && !deps.contains(&imp) {
+            if imp.starts_with(&pkg_prefix) && !deps.contains(&imp) {
                 deps.push(imp);
             }
         }
@@ -252,6 +253,11 @@ pub fn scan_imports(tree: &Path) -> Result<ImportScan> {
     Ok(scan)
 }
 
+/// Scan every `*.lean` file under `<tree>/Apc/` and collect its `Apc.*` imports.
+pub fn scan_imports(tree: &Path) -> Result<ImportScan> {
+    scan_imports_pkg(tree, "Apc")
+}
+
 /// Format a compact summary of the `Apc.*` import graph for agent prompts.
 /// `tags` maps module names to status annotations (e.g. `in-Solution`, `ERROR`,
 /// `ORPHAN`). Missing `Apc.*` imports are always marked inline as `[MISSING]`.
@@ -272,7 +278,7 @@ pub fn format_import_graph(scan: &ImportScan, tags: &BTreeMap<String, Vec<String
             .map(|t| format!(" [{}]", t.join(", ")))
             .unwrap_or_default();
         let dep_str = if deps.is_empty() {
-            "(no Apc imports)".to_string()
+            "(no local imports)".to_string()
         } else {
             deps.iter()
                 .map(|d| {

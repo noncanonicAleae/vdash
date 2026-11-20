@@ -1,4 +1,4 @@
-namespace Apc.Spec
+namespace Isort.Spec
 
 /-- Buggy insert that drops `x` when it equals an existing element. -/
 def insertBad (x : Nat) : List Nat → List Nat
@@ -13,4 +13,4 @@ def isortBad : List Nat → List Nat
   | [] => []
   | x :: xs => insertBad x (isortBad xs)
 
-end Apc.Spec
+end Isort.Spec

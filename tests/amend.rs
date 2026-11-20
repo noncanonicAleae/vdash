@@ -11,7 +11,7 @@ use vdash::backend::pool::Pool;
 use vdash::config::{BackendKind, Role};
 use vdash::events;
 use vdash::gate;
-use vdash::paths::{init_campaign, Ctx, ISORT_REFERENCE_SOLUTION};
+use vdash::paths::{init_campaign, isort_reference_solution, Ctx};
 use vdash::util;
 use serde_json::json;
 use tempfile::TempDir;
@@ -266,7 +266,7 @@ fn m6_02_and_m6_03_disproof_apply_gate_and_rollback_with_lean() {
 
     // 3. Before applying amendment 002, a solution written against the amended spec (`≤`) is REJECTED
     //    because `.heldout/` still has `<`!
-    fs::write(ctx.campaign.solution_file(), ISORT_REFERENCE_SOLUTION).unwrap();
+    fs::write(ctx.campaign.solution_file(), isort_reference_solution("Apc")).unwrap();
     let v_before = gate::run(&ctx).unwrap();
     assert!(!v_before.ok, "solution for `≤` must be rejected while heldout still has `<`");
 

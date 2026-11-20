@@ -6,8 +6,8 @@ file you own for this round, and instructions from your team lead. Your job is t
 the goal's theorem compile, with a real proof, in your file.
 
 ## You may
-- Read any file in the campaign (the spec in `lean/Apc/Spec/`, the library in
-  `lean/Apc/Proof/Lib/`, other proof files) to find definitions and lemmas.
+- Read any file in the campaign (the spec in `lean/{{package}}/Spec/`, the library in
+  `lean/{{package}}/Proof/Lib/`, other proof files) to find definitions and lemmas.
 - Edit and create content in your assigned file only.
 - Add helper lemmas to your file, above the goal.
 - Run `vdash check <your file>` and `vdash axioms <your file> <Name>...` as often as you like. If `vdash` is not found in your sandbox (`command not found` / exit 127), do not retry it or try `lean`/`lake` or `BypassSandbox`, and do not report `stuck` for that reason: write your complete, sorry-free proof and report `proved`—the engine automatically runs `vdash check` after your reply and returns any compiler diagnostics in `<diagnostics>`.
@@ -18,13 +18,13 @@ the goal's theorem compile, with a real proof, in your file.
   `vdash search "<query>"`, and `cat`, `head`, `tail`, `ls`, `wc`, `grep`, `rg`,
   `echo`. You may chain or pipe them with each other (`vdash check f; echo
   "exit=$?"`, `ls d; echo ---; grep -n x f`, `cat f | head`). Give every path from
-  the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`);
+  the campaign root (`cat lean/{{package}}/Solution.lean`, `grep -rn x lean/{{package}}/Proof`);
   never `cd`. These are always denied and waste your turn: shell writes (`cat > f`,
   heredocs, `>`, `sed -i`, `cp`, `touch`, `python3`), a prefix such as `timeout`,
   `vdash --help`, `lean`, `lake`, `find`, `sed`, `which`. Anything else is denied.
 
-- Read `<import_graph>`: every `Apc.*` module, the modules it imports, the goals that
-  own it, and whether `Apc.Solution` reaches it. If your file fails only because a
+- Read `<import_graph>`: every `{{package}}.*` module, the modules it imports, the goals that
+  own it, and whether `{{package}}.Solution` reaches it. If your file fails only because a
   module it imports is broken (`dependency ... failed`), say so in `notes` and name
   that module; you cannot fix it from your file.
 
@@ -75,8 +75,8 @@ Return one JSON object with these keys:
 - `lean_names`: full names of the theorems you proved, goal first.
 - `new_definitions`: list of `{name, witness}`, one per new `def` you introduced that
   is used as a hypothesis, predicate or invariant (never list theorems here). Both
-  are full Lean names (`Apc.…`), and the witness theorem's statement must mention
-  the definition, for example `theorem Apc.Proof.Work.inv_holds : Apc.Proof.Work.Inv [1, 2]`.
+  are full Lean names (`{{package}}.…`), and the witness theorem's statement must mention
+  the definition, for example `theorem {{package}}.Proof.Work.inv_holds : {{package}}.Proof.Work.Inv [1, 2]`.
   The engine checks this. Empty list if none.
 - `notes`: under 800 characters: what you did, what is left, what blocked you.
 - `amendment`: `null`, unless the goal is false because the spec is wrong; then an

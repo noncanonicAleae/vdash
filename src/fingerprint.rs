@@ -177,8 +177,9 @@ fn run_driver(
         .collect();
     let names_list = format!("[{}]", quoted_names.join(", "));
 
+    let pkg = ctx.pkg();
     let driver_src = format!(
-        "import ApcTool.Fingerprint\nimport {root_module}\n\n#eval ApcTool.main \"{mode}\" {names_list}\n"
+        "import ApcTool.Fingerprint\nimport {root_module}\n\n#eval ApcTool.main \"{pkg}\" \"{mode}\" {names_list}\n"
     );
 
     let pid = std::process::id();
@@ -254,7 +255,8 @@ fn hash_fingerprints(mut fps: Fingerprints) -> Fingerprints {
 }
 
 pub fn targets(ctx: &Ctx, tree: &Path, build_dir: &Path) -> Result<Fingerprints> {
-    let raw_json = run_driver(ctx, tree, build_dir, "Apc.Challenge", "targets", &[])?;
+    let chal = ctx.challenge_mod();
+    let raw_json = run_driver(ctx, tree, build_dir, &chal, "targets", &[])?;
     let fps: Fingerprints = serde_json::from_str(&raw_json).map_err(|e| {
         VdashError::new(
             1,
@@ -382,10 +384,10 @@ pub fn axioms_cmd(
 pub fn tcb_cmd(ctx: &Ctx) -> Result<String> {
     let tree = ctx.campaign.lean_dir();
     let build_dir = ctx.campaign.build_work_dir();
-    let target_mod = "Apc.Challenge".to_string();
+    let target_mod = ctx.challenge_mod();
     let rep = lean::build::build(ctx, &tree, &build_dir, Some(std::slice::from_ref(&target_mod)))?;
     if !rep.ok {
-        return Err(VdashError::new(1, "failed to build Apc.Challenge for tcb"));
+        return Err(VdashError::new(1, format!("failed to build {target_mod} for tcb")));
     }
 
     let fps = targets(ctx, &tree, &build_dir)?;

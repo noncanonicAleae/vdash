@@ -242,7 +242,7 @@ fn collect_trusted_spec_inline(ctx: &Ctx) -> String {
         }
         out.push('\n');
     }
-    for rel in ctx.campaign.trusted_files() {
+    for rel in ctx.trusted_files() {
         let full = ctx.campaign.root.join(&rel);
         if let Ok(text) = fs::read_to_string(&full) {
             out.push_str(&format!("### {}\n", rel.display()));
@@ -331,7 +331,7 @@ pub fn propose(
 
     // Early rejections without calling the critic:
     // 1. `file` is not a trusted file
-    let trusted = ctx.campaign.trusted_files();
+    let trusted = ctx.trusted_files();
     let prop_rel = PathBuf::from(&prop.file);
     if !trusted.contains(&prop_rel) {
         rec.critic_reason = format!("'{}' is not a trusted specification file", prop.file);
@@ -605,18 +605,19 @@ pub fn apply(ctx: &Ctx, n: u32, approved_by: &str, accept_weakening: bool) -> Re
         let _ = util::set_readonly(held_file, true);
     };
 
-    let trusted_rels = ctx.campaign.trusted_files();
+    let trusted_rels = ctx.trusted_files();
     let mut trusted_mods = Vec::with_capacity(trusted_rels.len());
     for rel in &trusted_rels {
         trusted_mods.push(ctx.campaign.module_name(rel)?);
     }
 
+    let chal_mod = ctx.challenge_mod();
     let tree = ctx.campaign.lean_dir();
     let build_dir = ctx.campaign.build_work_dir();
     match lean::build::build(ctx, &tree, &build_dir, Some(&trusted_mods)) {
         Ok(rep) => {
             let spec_has_sorry = rep.results.iter().any(|(m, mr)| {
-                m != "Apc.Challenge"
+                m != &chal_mod
                     && mr.diagnostics.iter().any(|d| {
                         d.kind == "hasSorry"
                             || d.text.contains("declaration uses 'sorry'")
@@ -660,7 +661,9 @@ pub fn apply(ctx: &Ctx, n: u32, approved_by: &str, accept_weakening: bool) -> Re
 
     // Determine which goals depend on the edited file
     let edited_mod = ctx.campaign.module_name(&rec.file).ok();
-    let import_graph = lean::imports::scan_imports(&tree).map(|s| s.graph).unwrap_or_default();
+    let import_graph = lean::imports::scan_imports_pkg(&tree, ctx.pkg())
+        .map(|s| s.graph)
+        .unwrap_or_default();
 
     let round = util::load_state(&ctx.campaign)
         .map(|s| s.round)
@@ -674,7 +677,7 @@ pub fn apply(ctx: &Ctx, n: u32, approved_by: &str, accept_weakening: bool) -> Re
         }
         for g in s.goals.values_mut() {
             let affected = match (&edited_mod, ctx.campaign.module_name(&g.file).ok()) {
-                (Some(em), _) if em == "Apc.Challenge" => true,
+                (Some(em), _) if em == &chal_mod => true,
                 (Some(em), Some(gm)) => {
                     let closure = lean::imports::closure_of(&import_graph, std::slice::from_ref(&gm));
                     closure.contains(em) || !ctx.campaign.root.join(&g.file).is_file()

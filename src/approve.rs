@@ -40,11 +40,11 @@ pub fn approve(ctx: &Ctx) -> Result<String> {
         ));
     }
 
-    let trusted_rels = ctx.campaign.trusted_files();
-    if !ctx.campaign.challenge_file().is_file() {
+    let trusted_rels = ctx.trusted_files();
+    if !ctx.challenge_file().is_file() {
         return Err(VdashError::new(
             1,
-            "missing lean/Apc/Challenge.lean".to_string(),
+            format!("missing {}", ctx.challenge_rel()),
         ));
     }
 
@@ -70,8 +70,9 @@ pub fn approve(ctx: &Ctx) -> Result<String> {
     }
 
     // 3. Every hasSorry diagnostic must be in Challenge.lean; every theorem in Challenge.lean must have one
+    let chal_mod = ctx.challenge_mod();
     for (mod_name, mr) in &rep.results {
-        if mod_name != "Apc.Challenge" {
+        if mod_name != &chal_mod {
             for d in &mr.diagnostics {
                 if d.kind == "hasSorry" || (d.severity == "warning" && d.text.contains("sorry")) {
                     return Err(VdashError::new(
@@ -90,7 +91,7 @@ pub fn approve(ctx: &Ctx) -> Result<String> {
     if fps.is_empty() {
         return Err(VdashError::new(
             1,
-            "no target theorems found in Apc.Challenge".to_string(),
+            format!("no target theorems found in {chal_mod}"),
         ));
     }
     for (tname, tfp) in &fps {
@@ -105,7 +106,7 @@ pub fn approve(ctx: &Ctx) -> Result<String> {
     }
     let chal_sorry_count = rep
         .results
-        .get("Apc.Challenge")
+        .get(&chal_mod)
         .map(|mr| {
             mr.diagnostics
                 .iter()
@@ -128,9 +129,10 @@ pub fn approve(ctx: &Ctx) -> Result<String> {
     let mut out_lines = Vec::new();
 
     // 4. Warn for each line starting with `theorem` or `lemma` in Spec/** outside Tests.lean
+    let spec_prefix = ctx.spec_rel_prefix();
     for rel in &trusted_rels {
         let rel_str = rel.display().to_string();
-        if rel_str.starts_with("lean/Apc/Spec/") && !rel_str.ends_with("/Tests.lean") {
+        if rel_str.starts_with(&spec_prefix) && !rel_str.ends_with("/Tests.lean") {
             let full = ctx.campaign.root.join(rel);
             let content = fs::read_to_string(&full).map_err(|e| VdashError::io_path(&full, e))?;
             for (idx, line) in content.lines().enumerate() {
@@ -187,10 +189,11 @@ pub fn approve(ctx: &Ctx) -> Result<String> {
     }
 
     // 6. Write Solution.lean if absent
-    let sol_path = ctx.campaign.solution_file();
+    let sol_path = ctx.solution_file();
     if !sol_path.exists() {
-        let chal_bytes = fs::read(ctx.campaign.challenge_file())
-            .map_err(|e| VdashError::io_path(ctx.campaign.challenge_file(), e))?;
+        let chal_path = ctx.challenge_file();
+        let chal_bytes = fs::read(&chal_path)
+            .map_err(|e| VdashError::io_path(&chal_path, e))?;
         fs::write(&sol_path, chal_bytes).map_err(|e| VdashError::io_path(&sol_path, e))?;
     }
 
@@ -290,6 +293,9 @@ pub fn restart(ctx: &Ctx) -> Result<String> {
 
     util::commit_all(&ctx.campaign, "vdash: restart (reopen spec phase)")?;
 
-    Ok("restarted: campaign reopened in phase 'spec' (existing proofs preserved)\n\
-        next: edit sources/BRIEF.md or lean/Apc/Challenge.lean (or run `vdash spec revise \"...\"`), then `vdash approve` and `vdash prove`\n".to_string())
+    Ok(format!(
+        "restarted: campaign reopened in phase 'spec' (existing proofs preserved)\n\
+        next: edit sources/BRIEF.md or {} (or run `vdash spec revise \"...\"`), then `vdash approve` and `vdash prove`\n",
+        ctx.challenge_rel()
+    ))
 }

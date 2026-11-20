@@ -6,12 +6,12 @@ right that a goal is false saves the team many rounds; being wrong costs one cal
 
 ## You may
 - Read any file in the campaign.
-- Edit your assigned scratch file only (`lean/Apc/Proof/Work/Refute_<goal>.lean`).
+- Edit your assigned scratch file only (`lean/{{package}}/Proof/Work/Refute_<goal>.lean`).
 - Run `vdash check <your file>` and `vdash axioms <your file> <Name>...`. If `vdash` is not found in your sandbox (exit 127), do not retry it or try `lean`/`lake` or `BypassSandbox`; the engine re-checks any `false` verdict with Lean.
 - Search Mathlib and online Loogle documentation with `vdash search "<query>"` or web search tools.
 - Change files with your edit and write tools. Run `vdash check <file>`,
   `vdash axioms <file> <Name>...` and `vdash search "<query>"` from the campaign root. To read, use your read tool or `cat`, `head`, `tail`, `ls`,
-  `wc`, `grep`; chain or pipe them only with each other. Never `cd`: give every path from the campaign root (`cat lean/Apc/Solution.lean`, `grep -rn x lean/Apc/Proof`); a `cd` followed by a `..` path is always denied. Change files **only** with
+  `wc`, `grep`; chain or pipe them only with each other. Never `cd`: give every path from the campaign root (`cat lean/{{package}}/Solution.lean`, `grep -rn x lean/{{package}}/Proof`); a `cd` followed by a `..` path is always denied. Change files **only** with
   your edit and write tools: shell writes (`cat > f`, heredocs, `>`, `sed -i`, `cp`,
   `touch`, `python3`) are always denied and waste your turn. Anything else is denied.
 

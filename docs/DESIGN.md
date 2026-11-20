@@ -129,14 +129,14 @@ is §7. Measured behaviour (ROADMAP facts C6–C11, A10–A17):
   skills/                  # optional per-campaign overrides of the built-in skills
   spec/DEPARTURES.md       # where the Lean departs from the sources, and the effect
   spec/review-N.md         # reviewer critiques per spec round
-  lean/Apc/Spec/**         # TRUSTED. Definitions only.
-      Impl.lean            #   convention: the artifact under verification (if any)
-      Mutants.lean         #   convention: deliberately buggy variants (optional)
-      Tests.lean           #   convention: #eval / `example ... := by decide` sanity tests
-  lean/Apc/Challenge.lean  # TRUSTED. Target theorems, each `:= by sorry`
-  lean/Apc/Solution.lean   # untrusted. Restates the targets with proofs; does not import Challenge
-  lean/Apc/Proof/Lib/**    # untrusted lemma library (integrator-owned)
-  lean/Apc/Proof/Work/**   # untrusted scratch files (one worker per file)
+  lean/<Pkg>/Spec/**         # TRUSTED. Definitions only. (<Pkg> = campaign package, UpperCamelCase)
+      Impl.lean              #   convention: the artifact under verification (if any)
+      Mutants.lean           #   convention: deliberately buggy variants (optional)
+      Tests.lean             #   convention: #eval / `example ... := by decide` sanity tests
+  lean/<Pkg>/Challenge.lean  # TRUSTED. Target theorems, each `:= by sorry`
+  lean/<Pkg>/Solution.lean   # untrusted. Restates the targets with proofs; does not import Challenge
+  lean/<Pkg>/Proof/Lib/**    # untrusted lemma library (integrator-owned)
+  lean/<Pkg>/Proof/Work/**   # untrusted scratch files (one worker per file)
   .heldout/                # copy of the trusted files; changed only by the engine
   .build/{work,gate}/      # oleans
   plan.json  state.json  bulletin.md
@@ -162,7 +162,8 @@ Re-entrant; all state is in files, and the user may hand-edit the Lean between a
 steps. Each step exists as a one-shot command and as an action in the app, where the
 user simply types to the spec-writer.
 
-- `vdash init <dir> --host <lake project>` creates the layout.
+- `vdash init <dir> --host <lake project> [--package <Name>]` creates the layout
+  (`--package` defaults to UpperCamelCase of `<dir>`).
 - `vdash spec draft`: the `spec_writer` reads `sources/` and writes `Spec/**`,
   `Challenge.lean` and `spec/DEPARTURES.md`. Its skill requires:
   - a small set of top-level statements;

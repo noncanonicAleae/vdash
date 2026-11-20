@@ -122,7 +122,7 @@ pub fn create(ctx: &Ctx, baseline_commit: &str) -> Result<Anchor> {
     let m = if !held_files.is_empty() {
         manifest(&heldout_dir, &held_files)?
     } else {
-        let trusted = ctx.campaign.trusted_files();
+        let trusted = ctx.trusted_files();
         manifest(&ctx.campaign.root, &trusted)?
     };
     let mh = manifest_hash(&m);

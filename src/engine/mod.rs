@@ -309,8 +309,10 @@ pub fn enforce_against_git(ctx: &Ctx, allowed: &BTreeSet<String>) -> Result<Vec<
         if written_by_engine(&path) {
             continue;
         }
+        let sol_rel = ctx.solution_rel();
+        let proof_pfx = ctx.proof_rel_prefix();
         let ok = allowed.iter().any(|a| if a.ends_with('/') { path.starts_with(a.as_str()) } else { a == &path })
-            && (path == "lean/Apc/Solution.lean" || (path.starts_with("lean/Apc/Proof/") && path.ends_with(".lean")));
+            && (path == sol_rel || (path.starts_with(&proof_pfx) && path.ends_with(".lean")));
         if ok {
             continue;
         }
@@ -459,7 +461,7 @@ impl<'p> Engine<'p> {
                 Ok(false)
             }
             "verify" if self.opts.single => {
-                let allowed: BTreeSet<String> = ["lean/Apc/Solution.lean".to_string()].into();
+                let allowed: BTreeSet<String> = [self.ctx.solution_rel()].into();
                 self.enforce(round, &allowed)?;
                 Ok(false)
             }
@@ -485,25 +487,29 @@ impl<'p> Engine<'p> {
         if open.is_empty() {
             return Ok(());
         }
-        let challenge = std::fs::read_to_string(self.ctx.campaign.heldout_tree().join("Apc/Challenge.lean")).unwrap_or_default();
-        let sol_path = self.ctx.campaign.solution_file();
+        let challenge = std::fs::read_to_string(self.ctx.campaign.heldout_tree().join(self.ctx.tree_challenge_rel())).unwrap_or_default();
+        let sol_path = self.ctx.solution_file();
+        let sol_rel = self.ctx.solution_rel();
+        let chal_mod = self.ctx.challenge_mod();
         self.snap = Some(policy::snapshot(&self.ctx));
-        let task = "Prove every unaccepted target below in lean/Apc/Solution.lean. Solution.lean must restate each target theorem with exactly the statement in Challenge.lean (same name, same namespace) and prove it. It must not import Apc.Challenge. Use goal_id \"all\".";
+        let task = format!(
+            "Prove every unaccepted target below in {sol_rel}. Solution.lean must restate each target theorem with exactly the statement in Challenge.lean (same name, same namespace) and prove it. It must not import {chal_mod}. Use goal_id \"all\"."
+        );
         let open_s = open.join("\n");
         let build = |diag: Option<&str>| {
             let t = match diag {
-                None => task.to_string(),
+                None => task.clone(),
                 Some(_) => format!("{task} The engine checked Solution.lean after your last reply and it does not compile cleanly yet: fix the errors below."),
             };
             crate::agents::Request::new(Role::Worker, crate::schemas::Reply::Worker, t)
-                .section("goal", format!("goal_id: all\nfile: lean/Apc/Solution.lean\nunaccepted targets:\n{open_s}"))
+                .section("goal", format!("goal_id: all\nfile: {sol_rel}\nunaccepted targets:\n{open_s}"))
                 .section("challenge", challenge.clone())
                 .section("file", std::fs::read_to_string(&sol_path).unwrap_or_default())
                 .section("diagnostics", diag.unwrap_or("").to_string())
                 .section("bulletin", bulletin_tail(&self.ctx))
                 .label("all")
         };
-        let (_, out) = team::run_worker_checked(self, round, "lean/Apc/Solution.lean", true, build)?;
+        let (_, out) = team::run_worker_checked(self, round, &sol_rel, true, build)?;
         if let crate::agents::Outcome::Ok(v) = out {
             let notes = v["notes"].as_str().unwrap_or("");
             if !notes.is_empty() {

@@ -27,6 +27,8 @@ fn m1_11_gate_all_thirteen_scenarios() {
             host.to_str().unwrap(),
             "--example",
             "isort",
+            "--package",
+            "Apc",
         ])
         .assert()
         .success();
@@ -51,7 +53,8 @@ fn m1_11_gate_all_thirteen_scenarios() {
     let sol_path = camp.solution_file();
     let defs_path = camp.lean_spec_dir().join("Defs.lean");
     let orig_defs = fs::read_to_string(&defs_path).unwrap();
-    let ref_sol = paths::ISORT_REFERENCE_SOLUTION;
+    let ref_sol_owned = paths::isort_reference_solution("Apc");
+    let ref_sol = ref_sol_owned.as_str();
 
     // (a) Reference solution -> all four accepted, exit 0
     fs::write(&sol_path, ref_sol).unwrap();
@@ -407,6 +410,8 @@ fn gate_cache_reuses_unchanged_parallel_leanchecker_and_fresh_rebuilds() {
             host.to_str().unwrap(),
             "--example",
             "isort",
+            "--package",
+            "Apc",
         ])
         .assert()
         .success();
@@ -434,9 +439,9 @@ fn gate_cache_reuses_unchanged_parallel_leanchecker_and_fresh_rebuilds() {
     let mod_b = camp.proof_lib_dir().join("HelperB.lean");
     fs::write(&mod_a, "theorem helper_a : 1 + 1 = 2 := rfl\n").unwrap();
     fs::write(&mod_b, "theorem helper_b : 2 + 2 = 4 := rfl\n").unwrap();
+    let ref_sol = paths::isort_reference_solution("Apc");
     let sol = format!(
-        "import Apc.Proof.Lib.HelperA\nimport Apc.Proof.Lib.HelperB\n{}",
-        paths::ISORT_REFERENCE_SOLUTION
+        "import Apc.Proof.Lib.HelperA\nimport Apc.Proof.Lib.HelperB\n{ref_sol}"
     );
     fs::write(camp.solution_file(), &sol).unwrap();
 
@@ -457,7 +462,7 @@ fn gate_cache_reuses_unchanged_parallel_leanchecker_and_fresh_rebuilds() {
     // Dropping HelperB from Solution.lean prunes stale HelperB.olean from gate_cache/sol_build.
     fs::write(
         camp.solution_file(),
-        format!("import Apc.Proof.Lib.HelperA\n{}", paths::ISORT_REFERENCE_SOLUTION),
+        format!("import Apc.Proof.Lib.HelperA\n{ref_sol}"),
     )
     .unwrap();
     let v3 = gate::run(&ctx).unwrap();

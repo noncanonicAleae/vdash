@@ -259,6 +259,8 @@ fn m1_05_apc_check_three_final_lines_and_capping() {
             host.to_str().unwrap(),
             "--example",
             "isort",
+            "--package",
+            "Apc",
         ])
         .assert()
         .success();
@@ -475,6 +477,8 @@ fn m1_07_apc_axioms_and_tcb() {
             host.to_str().unwrap(),
             "--example",
             "isort",
+            "--package",
+            "Apc",
         ])
         .assert()
         .success();
@@ -582,6 +586,8 @@ fn m1_09_apc_approve_happy_path_sorry_in_spec_and_double_approve() {
             host.to_str().unwrap(),
             "--example",
             "isort",
+            "--package",
+            "Apc",
         ])
         .assert()
         .success();
@@ -615,6 +621,8 @@ fn m1_09_apc_approve_happy_path_sorry_in_spec_and_double_approve() {
             host.to_str().unwrap(),
             "--example",
             "isort",
+            "--package",
+            "Apc",
         ])
         .assert()
         .success();

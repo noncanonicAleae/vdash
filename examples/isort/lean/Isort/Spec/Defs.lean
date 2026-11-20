@@ -1,6 +1,6 @@
-import Apc.Spec.Impl
+import Isort.Spec.Impl
 
-namespace Apc.Spec
+namespace Isort.Spec
 
 /-- A list of naturals is sorted in non-decreasing order. -/
 def Sorted : List Nat → Prop
@@ -12,4 +12,4 @@ def Sorted : List Nat → Prop
 def Correct (f : List Nat → List Nat) : Prop :=
   ∀ l, Sorted (f l) ∧ (f l).Perm l
 
-end Apc.Spec
+end Isort.Spec

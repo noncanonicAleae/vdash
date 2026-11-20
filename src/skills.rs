@@ -4,7 +4,7 @@ use std::fs;
 
 use crate::config::Role;
 use crate::error::{VdashError, Result};
-use crate::paths::Campaign;
+use crate::paths::{Campaign, Ctx};
 
 pub const SECTIONS: [&str; 6] = [
     "Role",
@@ -37,6 +37,12 @@ pub fn load(c: &Campaign, role: Role) -> Result<String> {
         return fs::read_to_string(&p).map_err(|e| VdashError::io_path(&p, e));
     }
     Ok(embedded(role).to_string())
+}
+
+/// Load a role skill with `{{package}}` substituted for the campaign's Lean package name.
+pub fn load_for(ctx: &Ctx, role: Role) -> Result<String> {
+    let text = load(&ctx.campaign, role)?;
+    Ok(text.replace("{{package}}", ctx.pkg()))
 }
 
 /// H2 section titles in order of appearance.

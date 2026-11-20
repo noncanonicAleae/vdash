@@ -46,14 +46,18 @@ pub struct Violation {
     pub change: &'static str,
 }
 
-fn in_area(scope: Scope, rel: &str) -> bool {
+fn in_area(pkg: &str, scope: Scope, rel: &str) -> bool {
+    let sol = format!("lean/{pkg}/Solution.lean");
+    let proof_pfx = format!("lean/{pkg}/Proof/");
+    let spec_pfx = format!("lean/{pkg}/Spec/");
+    let chal = format!("lean/{pkg}/Challenge.lean");
     match scope {
         Scope::Proof => {
-            rel == "lean/Apc/Solution.lean" || (rel.starts_with("lean/Apc/Proof/") && rel.ends_with(".lean"))
+            rel == sol || (rel.starts_with(&proof_pfx) && rel.ends_with(".lean"))
         }
         Scope::Spec => {
-            (rel.starts_with("lean/Apc/Spec/") && rel.ends_with(".lean"))
-                || rel == "lean/Apc/Challenge.lean"
+            (rel.starts_with(&spec_pfx) && rel.ends_with(".lean"))
+                || rel == chal
                 || rel == "spec/DEPARTURES.md"
         }
     }
@@ -202,8 +206,9 @@ fn remove(ctx: &Ctx, key: &str) -> Result<()> {
 pub fn enforce(ctx: &Ctx, snap: &Snapshot, scope: Scope, allowed: &BTreeSet<String>) -> Result<Vec<Violation>> {
     let now = scan(ctx);
     let mut v = Vec::new();
+    let pkg = ctx.pkg();
     let keep = |k: &str, is_symlink: bool| -> bool {
-        !k.starts_with(STATE_PREFIX) && !is_symlink && allowed_match(allowed, k) && in_area(scope, k)
+        !k.starts_with(STATE_PREFIX) && !is_symlink && allowed_match(allowed, k) && in_area(pkg, scope, k)
     };
     for (k, cur) in &now {
         let is_link = matches!(cur, Entry::Link(_));
@@ -242,12 +247,13 @@ fn scan_trusted(ctx: &Ctx) -> BTreeMap<String, Entry> {
     let mut m = BTreeMap::new();
     let root = &ctx.campaign.root;
 
-    let chal_rel = "lean/Apc/Challenge.lean";
-    if let Some(en) = read_entry(&root.join(chal_rel)) {
-        m.insert(chal_rel.to_string(), en);
+    let chal_rel = ctx.challenge_rel();
+    if let Some(en) = read_entry(&root.join(&chal_rel)) {
+        m.insert(chal_rel, en);
     }
 
-    for dir_rel in ["lean/Apc/Spec", ".heldout"] {
+    let spec_dir_rel = format!("lean/{}/Spec", ctx.pkg());
+    for dir_rel in [spec_dir_rel.as_str(), ".heldout"] {
         let dir = root.join(dir_rel);
         let Ok(md) = fs::symlink_metadata(&dir) else {
             continue;
@@ -280,10 +286,13 @@ fn scan_trusted(ctx: &Ctx) -> BTreeMap<String, Entry> {
 /// checks a worker's file, so the check runs against the real spec.
 pub fn restore_trusted(ctx: &Ctx, snap: &Snapshot) -> Result<Vec<Violation>> {
     let now = scan_trusted(ctx);
+    let chal_rel = ctx.challenge_rel();
+    let spec_dir_rel = format!("lean/{}/Spec", ctx.pkg());
+    let spec_pfx = ctx.spec_rel_prefix();
     let trusted = |k: &str| {
-        k == "lean/Apc/Challenge.lean"
-            || k == "lean/Apc/Spec"
-            || k.starts_with("lean/Apc/Spec/")
+        k == chal_rel
+            || k == spec_dir_rel
+            || k.starts_with(&spec_pfx)
             || k == ".heldout"
             || k.starts_with(".heldout/")
             || k.starts_with(STATE_PREFIX)

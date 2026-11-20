@@ -23,8 +23,7 @@ pub struct ProofWatch {
 }
 
 fn roots(ctx: &Ctx) -> Vec<PathBuf> {
-    let c = &ctx.campaign;
-    vec![c.proof_dir(), c.proof_work_dir(), c.solution_file()]
+    vec![ctx.proof_dir(), ctx.proof_work_dir(), ctx.solution_file()]
 }
 
 fn lean_files(root: &Path) -> Vec<PathBuf> {

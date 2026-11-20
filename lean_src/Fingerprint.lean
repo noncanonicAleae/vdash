@@ -156,7 +156,7 @@ def serConstant (env : Environment) (cinfo : ConstantInfo) : Except String Strin
 
 abbrev ConstMemo := Std.HashMap Name (Json × Array Name)
 
-partial def buildClosureMemo (env : Environment) (seed : Array Name) (memoIn : ConstMemo) :
+partial def buildClosureMemo (env : Environment) (pkgPrefix : String) (seed : Array Name) (memoIn : ConstMemo) :
     Except String (List (String × Json) × ConstMemo) := do
   let mut queue : Array Name := seed
   let mut qIdx : Nat := 0
@@ -178,7 +178,7 @@ partial def buildClosureMemo (env : Environment) (seed : Array Name) (memoIn : C
         | none => throw s!"unknown constant {c}"
         | some cinfo =>
           let modName := moduleOfConst env c
-          if !modName.startsWith "Apc." then
+          if !modName.startsWith pkgPrefix then
             let obj := Json.mkObj [
               ("module", Json.str modName),
               ("ext", Json.bool true),
@@ -210,7 +210,7 @@ partial def buildClosureMemo (env : Environment) (seed : Array Name) (memoIn : C
               queue := queue.push nc
   return (entries.toList, memo)
 
-def fingerprintOneMemo (env : Environment) (n : Name) (memo : ConstMemo) :
+def fingerprintOneMemo (env : Environment) (pkgPrefix : String) (n : Name) (memo : ConstMemo) :
     MetaM ((String × Json) × ConstMemo) := do
   match env.find? n with
   | none => throwError s!"missing constant {n}"
@@ -220,7 +220,7 @@ def fingerprintOneMemo (env : Environment) (n : Name) (memo : ConstMemo) :
     let tySer ← match serTargetType cinfo with
       | .ok s => pure s
       | .error msg => throwError msg
-    let (closEntries, memo') ← match buildClosureMemo env (exprConsts cinfo.type) memo with
+    let (closEntries, memo') ← match buildClosureMemo env pkgPrefix (exprConsts cinfo.type) memo with
       | .ok res => pure res
       | .error msg => throwError msg
     let axs ← Lean.collectAxioms n
@@ -234,8 +234,8 @@ def fingerprintOneMemo (env : Environment) (n : Name) (memo : ConstMemo) :
     ]
     return ((n.toString, obj), memo')
 
-def findChallengeTargets (env : Environment) : Array Name := Id.run do
-  let targetMod : Name := (`Apc).str "Challenge"
+def findChallengeTargets (env : Environment) (pkg : String) : Array Name := Id.run do
+  let targetMod : Name := (Name.mkSimple pkg).str "Challenge"
   let mut out : Array Name := #[]
   for i in [:env.header.moduleNames.size] do
     if env.header.moduleNames[i]! == targetMod then
@@ -247,14 +247,15 @@ def findChallengeTargets (env : Environment) : Array Name := Id.run do
           | _ => pure ()
   return out
 
-def main (mode : String) (names : List String) : MetaM Unit := do
+def main (pkg : String) (mode : String) (names : List String) : MetaM Unit := do
   let env ← getEnv
+  let pkgPrefix := pkg ++ "."
   if mode == "targets" then
-    let tnames := findChallengeTargets env
+    let tnames := findChallengeTargets env pkg
     let mut pairs : Array (String × Json) := #[]
     let mut memo : ConstMemo := {}
     for n in tnames do
-      let (p, memo') ← fingerprintOneMemo env n memo
+      let (p, memo') ← fingerprintOneMemo env pkgPrefix n memo
       memo := memo'
       pairs := pairs.push p
     let j := Json.mkObj pairs.toList
@@ -265,7 +266,7 @@ def main (mode : String) (names : List String) : MetaM Unit := do
     for s in names do
       let n := s.toName
       if (env.find? n).isSome then
-        let (p, memo') ← fingerprintOneMemo env n memo
+        let (p, memo') ← fingerprintOneMemo env pkgPrefix n memo
         memo := memo'
         pairs := pairs.push p
     let j := Json.mkObj pairs.toList

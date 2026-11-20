@@ -1,8 +1,8 @@
-import Apc.Spec.Impl
-import Apc.Spec.Defs
-import Apc.Spec.Mutants
+import Isort.Spec.Impl
+import Isort.Spec.Defs
+import Isort.Spec.Mutants
 
-namespace Apc
+namespace Isort
 
 theorem isort_correct : Spec.Correct Spec.isort := by
   sorry
@@ -16,4 +16,4 @@ theorem sorted_nonvacuous : ∃ l : List Nat, 2 ≤ l.length ∧ Spec.Sorted l :
 theorem isortBad_incorrect : ¬ Spec.Correct Spec.isortBad := by
   sorry
 
-end Apc
+end Isort

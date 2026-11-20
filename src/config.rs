@@ -354,6 +354,79 @@ fn parse_role_spec(role: Role, spec: Option<RawRoleSpec>, default: &[&str]) -> R
     Ok(out)
 }
 
+/// Reserved top-level Lean/Lake/Mathlib module roots that cannot be used as a
+/// campaign's package name.
+const RESERVED_PACKAGES: [&str; 10] = [
+    "Init",
+    "Std",
+    "Lean",
+    "Lake",
+    "Mathlib",
+    "Batteries",
+    "Aesop",
+    "Qq",
+    "ProofWidgets",
+    "ApcTool",
+];
+
+/// Validate a campaign's Lean root package name: a single UpperCamelCase
+/// Lean identifier (ASCII uppercase start, ASCII alphanumerics or `_`), not
+/// colliding with reserved Lean/Mathlib roots.
+pub fn validate_package(pkg: &str) -> Result<()> {
+    let mut chars = pkg.chars();
+    let Some(first) = chars.next() else {
+        return Err(VdashError::new(
+            2,
+            "package name must not be empty",
+        ));
+    };
+    if !first.is_ascii_uppercase() || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(VdashError::new(
+            2,
+            format!(
+                "invalid package name '{pkg}': must start with an ASCII uppercase letter and contain only ASCII letters, digits, or '_'"
+            ),
+        ));
+    }
+    if RESERVED_PACKAGES.contains(&pkg) {
+        return Err(VdashError::new(
+            2,
+            format!("invalid package name '{pkg}': collides with a reserved Lean/Mathlib root"),
+        ));
+    }
+    Ok(())
+}
+
+/// Derive a default UpperCamelCase Lean package name from a campaign directory
+/// name (e.g. `bohms-theorem` -> `BohmsTheorem`, `isort` -> `Isort`).
+pub fn default_package_for_dir(dir: &Path) -> String {
+    let raw = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Campaign");
+    let mut out = String::new();
+    for seg in raw.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if seg.is_empty() {
+            continue;
+        }
+        let mut chs = seg.chars();
+        if let Some(first) = chs.next() {
+            out.push(first.to_ascii_uppercase());
+            out.push_str(chs.as_str());
+        }
+    }
+    if out.is_empty() {
+        return "Campaign".to_string();
+    }
+    if !out.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        out.insert(0, 'P');
+    }
+    if RESERVED_PACKAGES.contains(&out.as_str()) {
+        out.push_str("Campaign");
+    }
+    out
+}
+
 pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
     let path = campaign_dir.as_ref().join("campaign.toml");
     let content = match fs::read_to_string(&path) {
@@ -530,12 +603,7 @@ pub fn load(campaign_dir: impl AsRef<Path>) -> Result<Config> {
     };
 
     let package = raw.package.unwrap_or_else(|| "Apc".to_string());
-    if package != "Apc" {
-        return Err(VdashError::new(
-            2,
-            format!("campaign.toml: unsupported package '{package}' (only \"Apc\" is supported)"),
-        ));
-    }
+    validate_package(&package)?;
 
     Ok(Config {
         id: raw.id,
@@ -904,12 +972,32 @@ reviewer = ["claude:sonnet", "gemini"]
             host.display()
         ));
 
-        // 10. Unsupported package name
-        let err = write_and_err(&format!(
-            "id = \"abc\"\nhost_project = \"{}\"\npackage = \"CustomPkg\"\n",
-            host.display()
-        ));
-        assert!(err.message.contains("package"), "msg: {}", err.message);
+        // 10. Invalid package names (lowercase, dotted, reserved); valid custom package succeeds
+        for bad in ["", "lowercase", "Has.Dot", "Has-Dash", "123Start", "Mathlib", "Lean"] {
+            let err = write_and_err(&format!(
+                "id = \"abc\"\nhost_project = \"{}\"\npackage = \"{bad}\"\n",
+                host.display()
+            ));
+            assert!(err.message.contains("package"), "bad={bad} msg: {}", err.message);
+        }
+        fs::write(
+            camp.join("campaign.toml"),
+            format!("id = \"abc\"\nhost_project = \"{}\"\npackage = \"CustomPkg\"\n", host.display()),
+        )
+        .unwrap();
+        assert_eq!(load(&camp).unwrap().package, "CustomPkg");
+    }
+
+    #[test]
+    fn default_package_derives_upper_camel_case() {
+        assert_eq!(default_package_for_dir(Path::new("/tmp/bohms-theorem")), "BohmsTheorem");
+        assert_eq!(default_package_for_dir(Path::new("quartic-query-separation")), "QuarticQuerySeparation");
+        assert_eq!(default_package_for_dir(Path::new("isort")), "Isort");
+        assert_eq!(default_package_for_dir(Path::new("my_cool_thm")), "MyCoolThm");
+        assert_eq!(default_package_for_dir(Path::new("AlreadyCamel")), "AlreadyCamel");
+        assert_eq!(default_package_for_dir(Path::new("3sat")), "P3sat");
+        assert_eq!(default_package_for_dir(Path::new("mathlib")), "MathlibCampaign");
+        assert_eq!(default_package_for_dir(Path::new("---")), "Campaign");
     }
 
     #[test]

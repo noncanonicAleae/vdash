@@ -9,7 +9,7 @@ use vdash::error::{VdashError, Result};
 use vdash::fingerprint;
 use vdash::gate;
 use vdash::lean;
-use vdash::paths::{doctor, find_campaign, init_campaign, Campaign, Ctx};
+use vdash::paths::{doctor, find_campaign, init_campaign_with_package, Campaign, Ctx};
 use vdash::proc;
 use clap::{Parser, Subcommand};
 
@@ -48,6 +48,9 @@ enum Commands {
         host: PathBuf,
         #[arg(long)]
         example: Option<String>,
+        /// Lean root package/namespace name (default: UpperCamelCase of DIR)
+        #[arg(long)]
+        package: Option<String>,
     },
     /// Check external tools and logins
     Doctor,
@@ -265,9 +268,15 @@ fn detect_available_backends() -> Vec<BackendKind> {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Some(Commands::Init { dir, host, example }) => {
+        Some(Commands::Init { dir, host, example, package }) => {
             let backends = detect_available_backends();
-            if let Some(notice) = init_campaign(&dir, &host, example.as_deref(), &backends)? {
+            if let Some(notice) = init_campaign_with_package(
+                &dir,
+                &host,
+                example.as_deref(),
+                package.as_deref(),
+                &backends,
+            )? {
                 println!("vdash: {notice}");
             }
             Ok(())

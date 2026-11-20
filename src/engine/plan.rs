@@ -32,15 +32,17 @@ impl Plan {
     }
 }
 
-pub fn valid_file(f: &str) -> bool {
-    f == "lean/Apc/Solution.lean"
-        || (f.starts_with("lean/Apc/Proof/") && f.ends_with(".lean") && !f.contains(".."))
+pub fn valid_file(pkg: &str, f: &str) -> bool {
+    let sol = format!("lean/{pkg}/Solution.lean");
+    let proof_pfx = format!("lean/{pkg}/Proof/");
+    f == sol || (f.starts_with(&proof_pfx) && f.ends_with(".lean") && !f.contains(".."))
 }
 
 /// Problems with a plan; empty when it is usable.
-pub fn validate(goals: &[Goal], state: &State) -> Vec<String> {
+pub fn validate(pkg: &str, goals: &[Goal], state: &State) -> Vec<String> {
     let mut errs = Vec::new();
     let mut ids = BTreeSet::new();
+    let pkg_prefix = format!("{pkg}.");
     for g in goals {
         if !ids.insert(g.id.as_str()) {
             errs.push(format!("duplicate goal id {}", g.id));
@@ -48,11 +50,11 @@ pub fn validate(goals: &[Goal], state: &State) -> Vec<String> {
         if !matches!(g.kind.as_str(), "target" | "lemma" | "witness") {
             errs.push(format!("{}: kind must be target, lemma or witness", g.id));
         }
-        if !g.lean_name.starts_with("Apc.") {
-            errs.push(format!("{}: lean_name must start with Apc.", g.id));
+        if !g.lean_name.starts_with(&pkg_prefix) {
+            errs.push(format!("{}: lean_name must start with {pkg_prefix}", g.id));
         }
-        if !valid_file(&g.file) {
-            errs.push(format!("{}: file must be lean/Apc/Solution.lean or under lean/Apc/Proof/", g.id));
+        if !valid_file(pkg, &g.file) {
+            errs.push(format!("{}: file must be lean/{pkg}/Solution.lean or under lean/{pkg}/Proof/", g.id));
         }
     }
     for g in goals {
@@ -167,16 +169,16 @@ mod tests {
     #[test]
     fn validation_rules() {
         let s = st();
-        assert!(validate(&[g("g1", "target", "Apc.t", &[])], &s).is_empty());
-        let e = validate(&[g("g1", "lemma", "Apc.l", &["g9"])], &s);
+        assert!(validate("Apc", &[g("g1", "target", "Apc.t", &[])], &s).is_empty());
+        let e = validate("Apc", &[g("g1", "lemma", "Apc.l", &["g9"])], &s);
         assert!(e.iter().any(|x| x.contains("unknown goal g9")));
         assert!(e.iter().any(|x| x.contains("exactly one goal of kind target")));
-        let e = validate(&[g("g1", "target", "Apc.t", &["g2"]), g("g2", "lemma", "Apc.l", &["g1"])], &s);
+        let e = validate("Apc", &[g("g1", "target", "Apc.t", &["g2"]), g("g2", "lemma", "Apc.l", &["g1"])], &s);
         assert!(e.iter().any(|x| x.contains("cycle")));
         let mut bad = g("g1", "target", "Apc.t", &[]);
         bad.file = "lean/Apc/Spec/Defs.lean".into();
-        assert!(!validate(&[bad], &s).is_empty());
-        let e = validate(&[g("g1", "target", "Apc.t", &[]), g("g1", "lemma", "Mathlib.x", &[])], &s);
+        assert!(!validate("Apc", &[bad], &s).is_empty());
+        let e = validate("Apc", &[g("g1", "target", "Apc.t", &[]), g("g1", "lemma", "Mathlib.x", &[])], &s);
         assert!(e.iter().any(|x| x.contains("duplicate")));
         assert!(e.iter().any(|x| x.contains("Apc.")));
     }

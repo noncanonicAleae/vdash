@@ -94,9 +94,9 @@ fn init_creates_campaign_and_refuses_non_empty_or_bad_example() {
         "sources",
         "skills",
         "spec",
-        "lean/Apc/Spec",
-        "lean/Apc/Proof/Lib",
-        "lean/Apc/Proof/Work",
+        "lean/MyCampaign/Spec",
+        "lean/MyCampaign/Proof/Lib",
+        "lean/MyCampaign/Proof/Work",
         ".heldout",
         ".build/work",
         ".build/gate",
@@ -116,6 +116,7 @@ fn init_creates_campaign_and_refuses_non_empty_or_bad_example() {
     let cfg = vdash::config::load(&camp_dir).unwrap();
     assert_eq!(cfg.id.len(), 32);
     assert!(cfg.id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(cfg.package, "MyCampaign");
 
     let state: serde_json::Value = vdash::jsonio::read_json(camp_dir.join("state.json")).unwrap();
     assert_eq!(state["version"], 1);
@@ -212,21 +213,83 @@ fn init_example_isort_writes_five_lean_files_and_disables_mathlib() {
         .success();
 
     for rel in [
-        "lean/Apc/Spec/Impl.lean",
-        "lean/Apc/Spec/Defs.lean",
-        "lean/Apc/Spec/Mutants.lean",
-        "lean/Apc/Spec/Tests.lean",
-        "lean/Apc/Challenge.lean",
+        "lean/IsortCamp/Spec/Impl.lean",
+        "lean/IsortCamp/Spec/Defs.lean",
+        "lean/IsortCamp/Spec/Mutants.lean",
+        "lean/IsortCamp/Spec/Tests.lean",
+        "lean/IsortCamp/Challenge.lean",
     ] {
         assert!(
             camp_dir.join(rel).is_file(),
             "missing example file {rel}"
         );
     }
-    assert!(!camp_dir.join("lean/Apc/Solution.lean").exists());
+    assert!(!camp_dir.join("lean/IsortCamp/Solution.lean").exists());
+    assert!(
+        fs::read_to_string(camp_dir.join("lean/IsortCamp/Challenge.lean"))
+            .unwrap()
+            .contains("namespace IsortCamp")
+    );
 
     let cfg = vdash::config::load(&camp_dir).unwrap();
     assert!(!cfg.use_mathlib);
+    assert_eq!(cfg.package, "IsortCamp");
+}
+
+#[test]
+fn init_custom_package_flag_and_end_to_end_gate() {
+    let tmp = TempDir::new().unwrap();
+    let host = make_host(&tmp);
+    let bad_dir = tmp.path().join("bad_pkg");
+
+    // Invalid --package exits 2
+    apc_cmd()
+        .args([
+            "init",
+            bad_dir.to_str().unwrap(),
+            "--host",
+            host.to_str().unwrap(),
+            "--package",
+            "lowercase",
+        ])
+        .assert()
+        .code(2);
+
+    // Valid --package writes custom namespace and package field
+    let camp_dir = tmp.path().join("my-sort");
+    apc_cmd()
+        .args([
+            "init",
+            camp_dir.to_str().unwrap(),
+            "--host",
+            host.to_str().unwrap(),
+            "--example",
+            "isort",
+            "--package",
+            "CustomSort",
+        ])
+        .assert()
+        .success();
+
+    let cfg = vdash::config::load(&camp_dir).unwrap();
+    assert_eq!(cfg.package, "CustomSort");
+    assert!(camp_dir.join("lean/CustomSort/Challenge.lean").is_file());
+
+    require_lean!();
+    apc_cmd()
+        .args(["-C", camp_dir.to_str().unwrap(), "approve"])
+        .assert()
+        .success();
+
+    let sol_path = camp_dir.join("lean/CustomSort/Solution.lean");
+    fs::write(&sol_path, vdash::paths::isort_reference_solution("CustomSort")).unwrap();
+    let gate_out = apc_cmd()
+        .args(["-C", camp_dir.to_str().unwrap(), "gate", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&gate_out.get_output().stdout).unwrap();
+    assert_eq!(v["ok"], serde_json::json!(true));
+    assert_eq!(v["targets"]["CustomSort.isort_correct"]["accepted"], serde_json::json!(true));
 }
 
 #[test]
@@ -276,16 +339,16 @@ fn isort_example_and_reference_solution_compile_with_lean() {
     let tmp = TempDir::new().unwrap();
     let tree = tmp.path().join("lean");
     let build = tmp.path().join("build");
-    fs::create_dir_all(tree.join("Apc/Spec")).unwrap();
-    fs::create_dir_all(build.join("Apc/Spec")).unwrap();
+    fs::create_dir_all(tree.join("Isort/Spec")).unwrap();
+    fs::create_dir_all(build.join("Isort/Spec")).unwrap();
 
     for (rel, content) in [
-        ("Apc/Spec/Impl.lean", vdash::paths::ISORT_SPEC_IMPL),
-        ("Apc/Spec/Defs.lean", vdash::paths::ISORT_SPEC_DEFS),
-        ("Apc/Spec/Mutants.lean", vdash::paths::ISORT_SPEC_MUTANTS),
-        ("Apc/Spec/Tests.lean", vdash::paths::ISORT_SPEC_TESTS),
-        ("Apc/Challenge.lean", vdash::paths::ISORT_CHALLENGE),
-        ("Apc/Solution.lean", vdash::paths::ISORT_REFERENCE_SOLUTION),
+        ("Isort/Spec/Impl.lean", vdash::paths::ISORT_SPEC_IMPL),
+        ("Isort/Spec/Defs.lean", vdash::paths::ISORT_SPEC_DEFS),
+        ("Isort/Spec/Mutants.lean", vdash::paths::ISORT_SPEC_MUTANTS),
+        ("Isort/Spec/Tests.lean", vdash::paths::ISORT_SPEC_TESTS),
+        ("Isort/Challenge.lean", vdash::paths::ISORT_CHALLENGE),
+        ("Isort/Solution.lean", vdash::paths::ISORT_REFERENCE_SOLUTION),
     ] {
         fs::write(tree.join(rel), content).unwrap();
     }
@@ -318,11 +381,11 @@ fn isort_example_and_reference_solution_compile_with_lean() {
     };
 
     for clean_mod in [
-        "Apc/Spec/Impl",
-        "Apc/Spec/Defs",
-        "Apc/Spec/Mutants",
-        "Apc/Spec/Tests",
-        "Apc/Solution",
+        "Isort/Spec/Impl",
+        "Isort/Spec/Defs",
+        "Isort/Spec/Mutants",
+        "Isort/Spec/Tests",
+        "Isort/Solution",
     ] {
         let (code, stdout) = compile(clean_mod);
         assert_eq!(code, 0, "{clean_mod} failed to compile:\n{stdout}");
@@ -332,8 +395,8 @@ fn isort_example_and_reference_solution_compile_with_lean() {
         );
     }
 
-    let (code, stdout) = compile("Apc/Challenge");
-    assert_eq!(code, 0, "Apc/Challenge failed to compile:\n{stdout}");
+    let (code, stdout) = compile("Isort/Challenge");
+    assert_eq!(code, 0, "Isort/Challenge failed to compile:\n{stdout}");
     let sorry_warnings = stdout
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -381,8 +444,9 @@ fn restart_reopens_done_campaign_and_preserves_solution() {
         .success();
 
     // Install reference solution, run gate, and mark campaign done
-    let sol_path = camp_dir.join("lean/Apc/Solution.lean");
-    fs::write(&sol_path, vdash::paths::ISORT_REFERENCE_SOLUTION).unwrap();
+    let sol_path = camp_dir.join("lean/IsortRestart/Solution.lean");
+    let ref_sol = vdash::paths::isort_reference_solution("IsortRestart");
+    fs::write(&sol_path, &ref_sol).unwrap();
     apc_cmd()
         .args(["-C", camp_dir.to_str().unwrap(), "gate"])
         .assert()
@@ -409,13 +473,10 @@ fn restart_reopens_done_campaign_and_preserves_solution() {
     assert!(st.targets.is_empty());
     assert_eq!(st.round_data["next_revise_plan"], serde_json::json!(true));
     assert!(!camp.heldout_dir().exists());
-    assert_eq!(
-        fs::read_to_string(&sol_path).unwrap(),
-        vdash::paths::ISORT_REFERENCE_SOLUTION
-    );
+    assert_eq!(fs::read_to_string(&sol_path).unwrap(), ref_sol);
 
     // Add a new target theorem to Challenge.lean and re-approve
-    let chal_path = camp.challenge_file();
+    let chal_path = camp.challenge_file_for("IsortRestart");
     let mut chal = fs::read_to_string(&chal_path).unwrap();
     chal.push_str("\ntheorem isort_extra_true : True := by sorry\n");
     fs::write(&chal_path, chal).unwrap();
@@ -430,7 +491,7 @@ fn restart_reopens_done_campaign_and_preserves_solution() {
     assert_eq!(st_after.targets.len(), 5);
     assert!(
         st_after.targets.contains_key("isort_extra_true")
-            || st_after.targets.contains_key("Apc.isort_extra_true")
+            || st_after.targets.contains_key("IsortRestart.isort_extra_true")
     );
 }
 
