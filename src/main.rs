@@ -131,8 +131,10 @@ enum Commands {
     },
     /// Show or change which backend and model serves each role
     Model {
-        /// Optional `default` (restore the built-in Claude/Gemini split) or
+        /// Optional `default` (restore the built-in Claude/Gemini split),
+        /// `refresh [--quiet]` (reread `agy models`, recheck rejected models) or
         /// `<role|all|claude|gemini> <backend[:model]|model>`
+        #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Search Mathlib, campaign Lean files, and online Loogle documentation
@@ -200,6 +202,15 @@ fn locate_campaign(explicit: Option<&std::path::Path>) -> Result<Campaign> {
     find_campaign(explicit, env_val.as_deref(), &cwd)
 }
 
+/// `$XDG_CACHE_HOME/vdash/models.json`, else `~/.cache/vdash/models.json`.
+fn models_cache_path() -> PathBuf {
+    let base = match env::var("XDG_CACHE_HOME") {
+        Ok(x) if !x.is_empty() => PathBuf::from(x),
+        _ => PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())).join(".cache"),
+    };
+    base.join("vdash").join("models.json")
+}
+
 fn build_ctx(explicit: Option<&std::path::Path>) -> Result<(Ctx, PathBuf)> {
     let cwd = env::current_dir().map_err(|e| VdashError::new(2, format!("cannot read cwd: {e}")))?;
     let env_val = campaign_env();
@@ -229,6 +240,7 @@ fn build_ctx(explicit: Option<&std::path::Path>) -> Result<(Ctx, PathBuf)> {
             cfg,
             state_dir,
             exe,
+            models_cache: models_cache_path(),
         },
         cwd,
     ))
@@ -324,6 +336,12 @@ fn run(cli: Cli) -> Result<()> {
             if detach {
                 return detach_engine(&ctx, rounds, single);
             }
+            if ctx.cfg.backends.contains_key(&config::BackendKind::Gemini)
+                && vdash::models::gemini_stale(&vdash::models::load(&ctx.models_cache), vdash::models::now_unix())
+            {
+                // Best effort: the engine warns about configured models from this list.
+                let _ = vdash::models::refresh(&ctx, false);
+            }
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             vdash::engine::install_signal_handlers(stop.clone());
             let pool = vdash::backend::pool::Pool::from_config(&ctx);
@@ -357,6 +375,27 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Some(Commands::Model { args }) if args.first().map(String::as_str) == Some("refresh") => {
+            let (ctx, _) = build_ctx(cli.campaign_dir.as_deref())?;
+            // `--quiet` is the app's startup refresh: the Gemini list only, no output.
+            let quiet = match &args[1..] {
+                [] => false,
+                [q] if q == "--quiet" => true,
+                _ => return Err(VdashError::new(2, "usage: vdash model refresh [--quiet]")),
+            };
+            let lines = vdash::models::refresh(&ctx, !quiet)?;
+            if !quiet {
+                for l in lines {
+                    println!("vdash: {l}");
+                }
+                let cache = vdash::models::load(&ctx.models_cache);
+                print!("{}", vdash::models::catalog_text(&vdash::models::catalog(&cache, vdash::models::now_unix())));
+                for w in vdash::models::role_warnings(&ctx.cfg, &cache, vdash::models::now_unix()) {
+                    println!("warning: {w}");
+                }
+            }
+            Ok(())
+        }
         Some(Commands::Model { args }) => {
             let (ctx, _) = build_ctx(cli.campaign_dir.as_deref())?;
             let cmd_line = if args.is_empty() {
@@ -369,9 +408,7 @@ fn run(cli: Cli) -> Result<()> {
                     for l in vdash::tui::role_lines(&ctx) {
                         println!("{l}");
                     }
-                    println!("\nAvailable models:");
-                    println!("  claude   {}", vdash::tui::commands::CLAUDE_MODELS.join(", "));
-                    println!("  gemini   {}", vdash::tui::commands::GEMINI_MODELS.join(", "));
+                    print!("\n{}", vdash::models::catalog_text(&vdash::models::current(&ctx.models_cache)));
                     Ok(())
                 }
                 Ok(vdash::tui::commands::Input::Cmd(vdash::tui::commands::Cmd::Model(Some((role, entry))))) => {

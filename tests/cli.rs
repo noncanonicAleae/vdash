@@ -434,3 +434,54 @@ fn restart_reopens_done_campaign_and_preserves_solution() {
     );
 }
 
+
+#[test]
+fn model_refresh_reads_agy_models_and_rechecks_rejected_claude_models() {
+    let tmp = TempDir::new().unwrap();
+    let host = make_host(&tmp);
+    let camp_dir = tmp.path().join("models_camp");
+    apc_cmd().args(["init", camp_dir.to_str().unwrap(), "--host", host.to_str().unwrap()]).assert().success();
+    // Stand-ins for `agy models` (fact A6) and a Claude CLI that rejects every model
+    // as Fable is rejected on the Pro plan (fact C17).
+    let agy = tmp.path().join("agy.sh");
+    fs::write(
+        &agy,
+        "[ \"$1\" = models ] || exit 9\necho 'Fetching available models...'\nprintf 'gemini-4-neon-high\\tGemini 4 Neon (High)\\ngemini-4-hydrogen-high\\tGemini 4 Hydrogen (High)\\nclaude-opus-5-5-low\\tClaude Opus 5.5 (Low)\\n'\n",
+    )
+    .unwrap();
+    let claude = tmp.path().join("claude.sh");
+    fs::write(
+        &claude,
+        "cat >/dev/null\necho '{\"is_error\":true,\"result\":\"Fable 5.2 requires usage credits.\",\"api_error_status\":429,\"api_error_code\":\"credits_required\",\"api_error\":\"model_requires_usage_credits\"}'\n",
+    )
+    .unwrap();
+    fs::write(
+        camp_dir.join("campaign.toml"),
+        format!(
+            "id = \"0123456789abcdef0123456789abcdef\"\nhost_project = \"{}\"\nuse_mathlib = false\n[backends.claude]\ncommand = [\"sh\", \"{}\"]\n[backends.gemini]\ncommand = [\"sh\", \"{}\"]\n[roles]\nworker = [\"gemini:gemini-4-argon-high\", \"claude:fable\"]\n",
+            host.display(),
+            claude.display(),
+            agy.display()
+        ),
+    )
+    .unwrap();
+    let cache_home = tmp.path().join("cache");
+    let cache = cache_home.join("vdash/models.json");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    fs::write(&cache, r#"{"rejected":{"claude:fable":{"reason":"old","at":9999999999}}}"#).unwrap();
+
+    let run = |args: &[&str]| {
+        let a = apc_cmd().env("XDG_CACHE_HOME", &cache_home).args(["-C", camp_dir.to_str().unwrap()]).args(args).assert().success();
+        String::from_utf8_lossy(&a.get_output().stdout).to_string()
+    };
+    let out = run(&["model", "refresh"]);
+    assert!(out.contains("gemini: 2 models from `agy models`"), "{out}");
+    assert!(out.contains("claude:fable is still unavailable: Fable 5.2 requires usage credits."), "{out}");
+    assert!(out.contains("gemini   gemini-4-neon-high, gemini-4-hydrogen-high\n"), "{out}");
+    assert!(out.contains("warning: gemini:gemini-4-argon-high (worker) may not work: no longer listed by `agy models`; try `/model gemini gemini-4-neon-high`"), "{out}");
+    assert!(out.contains("warning: claude:fable (worker)"), "{out}");
+    let list = run(&["model"]);
+    assert!(list.contains("unavailable: claude:fable (Fable 5.2 requires usage credits.)"), "{list}");
+    assert!(!list.contains("claude   opus, sonnet, haiku, fable,"), "{list}");
+    assert!(run(&["model", "refresh", "--quiet"]).is_empty());
+}

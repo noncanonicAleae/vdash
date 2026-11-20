@@ -139,6 +139,14 @@ M4 interactive app · M5 spec phase · M6 amendments · M7 later · status log.
   word from the first call, the `session_id` stayed the same, and
   `cache_read_input_tokens` was 3586. `--json-schema` applies to the resumed turn.
 
+- C17. (probed 2026-11-20) The CLI has no command that lists models. A model the
+  account cannot use is rejected before any inference (`total_cost_usd` 0): an unknown
+  id gives `is_error`, `api_error_status` 404 and "There's an issue with the selected
+  model (X). It may not exist or you may not have access to it."; Fable on the Pro
+  subscription now gives `api_error_status` **429** with `api_error_code`
+  `credits_required`, `api_error` `model_requires_usage_credits` and "Fable 5.2
+  requires usage credits." (Corrects C12 for Fable.) That 429 is not a usage limit.
+
 ### Antigravity CLI (`agy` v1.5.7), the Gemini backend
 Google is moving Gemini CLI to Antigravity CLI; the user installed `agy` and is logged
 in. This is the Gemini-subscription backend. (The old `@google/gemini-cli` 0.68.0 that
@@ -162,9 +170,13 @@ was installed with bun earlier the same day is not used.)
   needs `--output-format stream-json`), `--print-timeout`. There is no system-prompt
   flag. Combining `--mode plan` with `--disable-slash-commands` prints the warning
   "--mode plan has no effect while slash command expansion is disabled".
-- A6. `agy models` lists `gemini-4-argon-{low,medium,high}`,
-  `gemini-4-hydrogen-{low,medium,high,xhigh}`, `gemini-3.8-flash-{low,medium,high}`,
-  and also `claude-opus-5-5-*`, `claude-sonnet-5-5-*` and `gpt-oss-120b-medium`. Model
+- A6. `agy models` prints `Fetching available models...` and then one `<id>\t<label>`
+  line per model the account can use. The list changes over time (corrected
+  2026-11-20: Neon appeared as Argon was deprecated), so vdash reads it at runtime
+  (M8-08) instead of keeping a copy. On 2026-11-20 it listed
+  `gemini-4-{neon,hydrogen}-{low,medium,high,xhigh}`, `gemini-4-argon-{low,medium,high}`,
+  `gemini-3.8-flash-{low,medium,high}`, `gemini-pro-orchestrator-{neon,g1-pro}`, and
+  also `claude-opus-5-5-*`, `claude-sonnet-5-5-*` and `gpt-oss-120b-medium`. Model
   ids carry the reasoning level as a suffix.
 
 - A7. `agy` loads `AGENTS.md` and `GEMINI.md` from the working directory into its
@@ -226,6 +238,12 @@ was installed with bun earlier the same day is not used.)
   `num_turns` 2, `usage.cache_read_tokens` 10375 of 12447 input). `--json-schema`
   applies to the resumed turn. The skill need not be resent.
 
+- A19. (probed 2026-11-20) An unknown `--model` fails at once with exit 1 and
+  `{"status":"ERROR","error":"invalid model selection (--model \"X\" ...): model X is not
+  recognized as a known model or custom model in settings\nAvailable models: ..."}`.
+  `gemini-4-neon-low` answered a one-word prompt (10 s of model time, 61 s wall); an
+  earlier call to it gave no output within 90 s.
+
 ### Not installed
 `node`, `comparator`, `landrun`, `lean4export`.
 
@@ -258,6 +276,7 @@ src/backend/claude.rs
 src/backend/gemini.rs
 src/backend/fake.rs
 src/backend/pool.rs        # role → backend choice, per-backend slots, quota pauses
+src/models.rs              # model catalog: agy models, rejected models, cache
 src/schemas.rs             # reply schemas + validator
 src/prompts.rs             # prompt assembly with budgets
 src/skills.rs              # embedded skills + campaign overrides
@@ -1526,6 +1545,29 @@ Gemini owns M8-03..M8-06.
   `vdash --help`). The integrator's request carries the current `vdash check` result
   of `Apc.Solution` so it starts from facts. Test: the argv contains the rule.
 
+- [x] **M8-08 Model list from the CLIs** (user request 2026-11-20). Facts A6, A19, C17.
+  `src/models.rs` keeps `<cache dir>/vdash/models.json` (`Ctx.models_cache`): the
+  Gemini ids from `agy models` (only `gemini-*`, no `orchestrator`) with the time
+  fetched, and the `backend:model` pairs a CLI rejected, each with its reason and
+  time (forgotten after 7 days). The catalog is the built-in Claude aliases and ids
+  (Claude cannot list models) or the cached Gemini list (else a built-in fallback),
+  minus the rejected pairs. A rejected model (`Failure::ModelUnavailable`: Claude 404,
+  or 429 `credits_required`; agy `invalid model selection`) is never a usage limit:
+  the pool drops that `backend:model` for the rest of the run, records it in the
+  cache (a Claude alias and its pinned id count as one model), emits a `note`, and
+  tries the role's next entry. `/model refresh`
+  and `vdash model refresh` reread `agy models` and probe again only the Claude
+  models marked rejected (free while still rejected); the app and `vdash prove`
+  refresh the Gemini list when it is older than 24 h. `/model`, completion and
+  `vdash model` show the catalog; a configured model that is not in it gets a
+  warning naming the same-family replacement (`gemini-4-argon-high` →
+  `gemini-4-neon-high`) when the app opens and when the engine starts.
+  Tests: `agy models` parsing; Claude and agy rejection parse as `ModelUnavailable`
+  and a Claude 429 usage limit still parses as `Quota`; catalog filtering and expiry;
+  replacement suggestion; the pool moves to the next entry without pausing the
+  backend; completion uses the catalog.
+  Done when: those pass, and `vdash model refresh` on this machine lists Neon.
+
 ---
 
 ## Status log
@@ -1856,3 +1898,17 @@ Gemini owns M8-03..M8-06.
   `search::tests::finds_local_declarations_and_ranks_exact_matches_first` (unicode case);
   clippy `-D warnings` clean and full `VDASH_TEST_HOST=/home/anachronist/lean_math cargo test --offline`
   passed (167 passed, 0 failed).
+- 2026-11-20 (Claude): M8-08 (user request: Argon → Neon, Fable off the Pro plan).
+  Facts C17, A19, A6 corrected. New `src/models.rs` (cache `~/.cache/vdash/models.json`
+  via `Ctx.models_cache`); `Failure::ModelUnavailable` (Claude 404 and 429
+  `model_requires_usage_credits`, agy `invalid model selection`), which the pool
+  handles by dropping the model, not by pausing the backend (Fable's 429 used to
+  pause all of Claude); `/model refresh`, `vdash model refresh [--quiet]`; quiet
+  refresh when the app opens and before `vdash prove` when the list is over 24 h old;
+  model warnings at app open and engine start. Hard-coded `CLAUDE_MODELS` /
+  `GEMINI_MODELS` removed from `tui/commands.rs`. Tests: `models::tests::*`,
+  `claude::tests::a_rejected_model_is_not_a_usage_limit`, gemini `classifies_failures`,
+  `pool::tests::rejected_model_moves_to_the_next_entry_without_pausing`, completion
+  tests, `cli::model_refresh_reads_agy_models_and_rechecks_rejected_claude_models`.
+  Live: `vdash model refresh` listed 14 Gemini models including `gemini-4-neon-*`,
+  and its free recheck of `claude:fable` got the `credits_required` refusal.

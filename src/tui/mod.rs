@@ -39,6 +39,8 @@ pub struct Ui {
     pub tick: u64,
     pub confirm_quit: bool,
     pub busy: Vec<String>,
+    /// Model names for completion (ROADMAP M8-08).
+    pub models: crate::models::Catalog,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,7 +61,7 @@ impl Ui {
 
     fn refresh_completions(&mut self, agents: &[String]) {
         self.completions = if self.input.starts_with('/') && !self.input.contains("  ") {
-            let c = commands::complete(&self.input, agents);
+            let c = commands::complete(&self.input, agents, &self.models);
             if c.len() == 1 && c[0] == self.input.trim_end() {
                 Vec::new()
             } else {
@@ -333,10 +335,9 @@ fn role_table(ctx: &Ctx, app: &App) -> String {
         };
         s.push_str(&format!("{k:<8} `{}` · {st}\n", b.command.join(" ")));
     }
-    s.push_str("\nAvailable models:\n");
-    s.push_str(&format!("  claude   {}\n", commands::CLAUDE_MODELS.join(", ")));
-    s.push_str(&format!("  gemini   {}\n", commands::GEMINI_MODELS.join(", ")));
-    s.push_str("\nChange with:\n  /model <role|all> <backend>[:<model>]   (e.g. /model worker gemini:gemini-4-argon-high)\n  /model <role> gemini,claude             (share a role between both backends)\n  /model <claude|gemini> <model>          (sets the model for all roles on that backend)");
+    s.push('\n');
+    s.push_str(&crate::models::catalog_text(&crate::models::current(&ctx.models_cache)));
+    s.push_str("\nChange with:\n  /model <role|all> <backend>[:<model>]   (e.g. /model worker gemini:gemini-4-neon-high)\n  /model <role> gemini,claude             (share a role between both backends)\n  /model <claude|gemini> <model>          (sets the model for all roles on that backend)\n  /model refresh                          (reread `agy models`, recheck rejected models)");
     s
 }
 
@@ -537,10 +538,30 @@ struct Session {
     verbose: Option<watch::ProofWatch>,
 }
 
+/// Runner label of the quiet Gemini list refresh when the app opens.
+const AUTO_REFRESH: &str = "models (auto)";
+
 /// Busy labels of the commands that run a spec loop.
 const SPEC_LOOP_LABELS: [&str; 3] = ["spec draft", "spec revise", "review"];
 
 impl Session {
+    /// Reload the model catalog; after the startup refresh, warn about configured
+    /// models that will not work (`vdash model refresh` prints its own warnings).
+    fn models_changed(&mut self, warn: bool) {
+        self.ui.models = crate::models::current(&self.ctx.models_cache);
+        if warn {
+            self.model_warnings();
+        }
+    }
+
+    fn model_warnings(&mut self) {
+        let cfg = config::load(&self.ctx.campaign.root).unwrap_or_else(|_| self.ctx.cfg.clone());
+        let cache = crate::models::load(&self.ctx.models_cache);
+        for w in crate::models::role_warnings(&cfg, &cache, crate::models::now_unix()) {
+            self.app.say(Kind::Warn, "models", w);
+        }
+    }
+
     fn reload_state(&mut self) {
         if let Ok(st) = util::load_state(&self.ctx.campaign) {
             self.app.load_state(&st);
@@ -686,6 +707,10 @@ impl Session {
                     .collect::<Vec<_>>()
                     .join("; ");
                 self.app.say(Kind::Good, "model", format!("{desc} ({how})"));
+            }
+            Cmd::ModelRefresh => {
+                self.busy("model refresh");
+                self.runner.vdash("model refresh", "models", vec!["model".into(), "refresh".into()]);
             }
             Cmd::ModelDefault => {
                 let live = self.app.engine.is_some();
@@ -871,6 +896,9 @@ impl Session {
                     if let Some(i) = self.ui.busy.iter().position(|b| *b == label) {
                         self.ui.busy.remove(i);
                     }
+                    if label == "model refresh" || label == AUTO_REFRESH {
+                        self.models_changed(label == AUTO_REFRESH);
+                    }
                     let loop_left = self.ui.busy.iter().any(|b| SPEC_LOOP_LABELS.contains(&b.as_str()));
                     if self.pending_approve && SPEC_LOOP_LABELS.contains(&label.as_str()) && !loop_left {
                         self.pending_approve = false;
@@ -922,6 +950,14 @@ pub fn run(ctx: Ctx) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut s = Session { runner: Runner { ctx: ctx.clone(), tx }, ctx, app, ui: Ui::default(), rx, offset, pending_login: None, pending_approve: false, verbose: None };
     s.reload_state();
+    s.ui.models = crate::models::current(&s.ctx.models_cache);
+    let cache = crate::models::load(&s.ctx.models_cache);
+    if s.ctx.cfg.backends.contains_key(&config::BackendKind::Gemini) && crate::models::gemini_stale(&cache, crate::models::now_unix()) {
+        // Warnings follow once the fresh list is in (`models_changed`).
+        s.runner.vdash(AUTO_REFRESH, "models", vec!["model".into(), "refresh".into(), "--quiet".into()]);
+    } else {
+        s.model_warnings();
+    }
     if s.app.engine.is_none() {
         // An engine_started without a matching stop in the replay is stale.
         s.app.agents.clear();

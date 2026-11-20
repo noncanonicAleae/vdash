@@ -117,7 +117,11 @@ pub fn parse(stdout: &str) -> AgentResult {
             r.failure = Some(Failure::Crash);
             return r;
         }
-        r.failure = Some(if code == Some(41) || looks_like_not_logged_in(&msg) {
+        // Fact A19: an unknown `--model` is refused before the turn starts.
+        let model_refused = msg.contains("invalid model selection") || msg.contains("not recognized as a known model");
+        r.failure = Some(if model_refused {
+            Failure::ModelUnavailable(crate::util::clip(msg.lines().next().unwrap_or("").trim(), 200, false))
+        } else if code == Some(41) || looks_like_not_logged_in(&msg) {
             Failure::NotLoggedIn
         } else if looks_like_quota(&msg) || code == Some(429) {
             Failure::Quota
@@ -242,6 +246,9 @@ mod tests {
         let q = r#"{"error":{"message":"RESOURCE_EXHAUSTED: quota exceeded","code":8}}"#;
         assert_eq!(parse(q).failure, Some(Failure::Quota));
         assert_eq!(parse("Segmentation fault").failure, Some(Failure::Crash));
+        // Fact A19.
+        let bad = r#"{"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection (--model \"gemini-x\" --effort \"\"): model gemini-x is not recognized as a known model or custom model in settings\nAvailable models:\n  Gemini 4 Neon (High)","finished_reason":"error"}"#;
+        assert!(matches!(parse(bad).failure, Some(Failure::ModelUnavailable(ref m)) if m.starts_with("invalid model selection") && !m.contains("Available")));
         let interrupted = r#"{"status":"ERROR","response":"{}","error":"The stream was interrupted. Please continue the task you were working on.","structured_output":{"lens":"soundness","findings":[],"verdict":"ok"},"finished_reason":"error"}"#;
         assert_eq!(parse(interrupted).failure, Some(Failure::Crash), "a cut-off turn is not a valid review");
     }

@@ -339,6 +339,10 @@ pub fn run(ctx: Ctx, pool: &Pool, opts: Opts, stop: Arc<AtomicBool>) -> Result<u
     }
     let mut eng = Engine::new(ctx, pool, opts, stop);
     events::emit(&eng.ctx, st.round, "engine_started", json!({"pid": std::process::id(), "mode": if eng.opts.single {"single"} else {"team"}}));
+    let cache = crate::models::load(&eng.ctx.models_cache);
+    for w in crate::models::role_warnings(&eng.ctx.cfg, &cache, crate::models::now_unix()) {
+        events::emit(&eng.ctx, st.round, "note", json!({"text": format!("model check: {w}")}));
+    }
     let res = eng.main_loop();
     let (code, reason) = match &res {
         Ok(0) => (0, "all targets accepted".to_string()),

@@ -76,6 +76,13 @@ paper), and proof work is spread across both subscriptions. A role with several
 entries is served by whichever listed backend has a free slot. The user changes any
 of this in the file or live with `/model`.
 
+**Model catalog.** Models come and go on both subscriptions, so the names `/model`
+offers are read at runtime, not compiled in: Gemini's from `agy models` (cached for a
+day), Claude's from the built-in aliases, which always mean the newest model of their
+family (the Claude CLI has no listing). A model a CLI refuses is a fact about the
+plan, not a usage limit: the pool drops it for the run and serves the role from its
+next entry, and the catalog leaves it out until a recheck finds it works.
+
 **Scheduling.** Each backend has its own concurrency cap (`max_concurrent`) and its
 own quota state. When one backend reports a usage limit it is paused while the other
 keeps working: until the reset time the CLI reports (`backend::quota_reset`, plus 20

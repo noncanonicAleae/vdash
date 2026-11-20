@@ -641,6 +641,7 @@ fn m1_09_apc_approve_happy_path_sorry_in_spec_and_double_approve() {
         cfg,
         state_dir,
         exe: std::path::PathBuf::from(apc_bin),
+        models_cache: xdg_state.join("models.json"),
     };
     assert!(vdash::anchor::verify(&ctx).is_empty());
 

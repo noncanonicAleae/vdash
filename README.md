@@ -203,39 +203,53 @@ Agents edit Lean files in place, so by default you only see their summaries. Wit
 
 ## 7. Choosing Claude & Gemini Models
 
-Every agent role can be routed to either `claude`, `gemini`, or a list of both (`["claude:sonnet", "gemini:gemini-4-argon-high"]`).
+Every agent role can be routed to either `claude`, `gemini`, or a list of both (`["claude:sonnet", "gemini:gemini-4-neon-high"]`).
 
-### Built-In Model Catalog (with Tab Completion)
-- **Claude (`claude`)**: aliases `opus`, `sonnet`, `haiku`, `fable`, and the pinned ids
-  `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-2`.
-  All of them work on a Pro subscription; Fable costs about three times Opus per call.
-- **Gemini (`agy`)**: Gemini 4 Argon `gemini-4-argon-{low,medium,high}`, Gemini 4
-  Hydrogen `gemini-4-hydrogen-{low,medium,high,xhigh}`, Gemini 3.8 Flash
-  `gemini-3.8-flash-{low,medium,high}`. The suffix is the reasoning level. `agy models`
-  prints the live list.
+### Model Catalog (with Tab Completion)
+The list follows what your subscriptions offer, so it keeps up as models are added
+and retired. It is cached in `~/.cache/vdash/models.json` (or `$XDG_CACHE_HOME/vdash/`).
+- **Gemini (`agy`)**: read from `agy models`: when the app opens or `vdash prove`
+  starts and the cached list is more than a day old, and on `/model refresh`. The
+  suffix is the reasoning level (`gemini-4-neon-high`). Until the first read, a
+  built-in list is shown.
+- **Claude (`claude`)**: the Claude CLI cannot list models, so the catalog is the
+  aliases `opus`, `sonnet`, `haiku`, `fable` (each always means the newest model of
+  its family) and their pinned ids `claude-opus-5-5`, `claude-sonnet-5-5`,
+  `claude-haiku-5-5`, `claude-fable-5-2`.
+- **Rejected models drop out.** When a CLI refuses a model (an unknown id, or Fable,
+  which now needs usage credits on Pro), the call moves to the role's next entry
+  instead of pausing the backend, and the model leaves the catalog for a week.
+  `/model` lists it under `unavailable:` with the CLI's reason; `/model refresh`
+  checks it again, which costs nothing while it is still refused.
+- **Stale assignments are flagged.** When the app opens and when the engine starts,
+  any role set to a refused model, or to a Gemini model `agy models` no longer
+  lists, gets a warning with a replacement (`gemini-4-argon-high` →
+  `gemini-4-neon-high`).
 
-Any other id the CLI accepts also works; the catalog only drives completion.
+Any other id the CLI accepts also works; the catalog drives completion and warnings.
 
 ### Examples (in the TUI or via `vdash model`)
 
 Inside the interactive TUI:
 ```text
 /model                                           # Show current assignments and model catalog
-/model worker gemini:gemini-4-argon-high         # Set worker to Gemini 4 Argon High
+/model refresh                                   # Reread `agy models`, recheck refused models
+/model worker gemini:gemini-4-neon-high         # Set worker to Gemini 4 Neon High
 /model worker claude opus                        # Set worker to Claude Opus
 /model claude claude-sonnet-5-5                  # Switch all Claude roles to claude-sonnet-5-5
 /model gemini gemini-4-hydrogen-high             # Switch all Gemini roles to gemini-4-hydrogen-high
 /model all claude:sonnet                         # Put every role on Claude Sonnet
-/model all gemini:gemini-4-argon-high            # Put every role on Gemini 4 Argon High
+/model all gemini:gemini-4-neon-high            # Put every role on Gemini 4 Neon High
 /model worker gemini,claude:sonnet               # Workers on both subscriptions
 ```
 
 From the command line (using `-C <DIR>` or from inside the campaign directory):
 ```bash
 vdash -C <DIR> model                                        # Show role assignments and model catalog
-vdash -C <DIR> model worker gemini:gemini-4-argon-high      # Set worker to Gemini 4 Argon High
+vdash -C <DIR> model refresh                                # Reread `agy models`, recheck refused models
+vdash -C <DIR> model worker gemini:gemini-4-neon-high      # Set worker to Gemini 4 Neon High
 vdash -C <DIR> model claude claude-sonnet-5-5               # Switch all Claude roles to claude-sonnet-5-5
-vdash -C <DIR> model all gemini:gemini-4-argon-high         # Move every role onto Gemini
+vdash -C <DIR> model all gemini:gemini-4-neon-high         # Move every role onto Gemini
 ```
 
 When an engine is running, `/model` (or `vdash model`) delivers the change live via the control inbox. The backend pool picks it up on its next backend choice, so it also rescues an agent that is waiting on a backend's usage limit: the retry goes to the new model at once (an agent already running is not interrupted). When no engine is running, it updates `campaign.toml` in place while preserving your comments.
@@ -250,7 +264,7 @@ If one of your subscriptions runs out of quota mid-campaign:
    ```bash
    # Stop the waiting engine, switch all roles to Gemini, and restart detached:
    vdash -C <CAMPAIGN_DIR> stop
-   vdash -C <CAMPAIGN_DIR> model all gemini:gemini-4-argon-high
+   vdash -C <CAMPAIGN_DIR> model all gemini:gemini-4-neon-high
    vdash -C <CAMPAIGN_DIR> prove --detach
    ```
    *(Or to move everything onto Claude: `vdash -C <CAMPAIGN_DIR> model all claude:opus`.)*

@@ -26,3 +26,4 @@ pub mod tui;
 pub mod monitor;
 pub mod kill;
 pub mod search;
+pub mod models;

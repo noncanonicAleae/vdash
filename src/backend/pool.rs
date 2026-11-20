@@ -2,7 +2,7 @@
 //! entries, bounds concurrency per backend, and pauses a backend that hits its
 //! usage limit while the other keeps working.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -52,6 +52,8 @@ struct Inner {
     /// over the `Ctx` a call was started with, so a change applies to the very
     /// next attempt, including a call that is retrying after a usage limit.
     overrides: BTreeMap<Role, Vec<RoleEntry>>,
+    /// `backend:model` pairs a CLI rejected in this run (`Failure::ModelUnavailable`).
+    rejected: BTreeSet<(BackendKind, String)>,
 }
 
 pub struct Pool {
@@ -84,7 +86,7 @@ impl Pool {
         }
         Pool {
             backends: map,
-            inner: Mutex::new(Inner { health, overrides: BTreeMap::new() }),
+            inner: Mutex::new(Inner { health, overrides: BTreeMap::new(), rejected: BTreeSet::new() }),
             cv: Condvar::new(),
             stop: Mutex::new(None),
             timing: Timing::from_ctx(ctx),
@@ -143,9 +145,16 @@ impl Pool {
     /// backend is paused or unavailable, never just because it has more free slots.
     fn candidates(&self, ctx: &Ctx, role: Role) -> Vec<(RoleEntry, bool)> {
         self.apply_pending_roles(ctx);
-        let live = self.inner.lock().unwrap().overrides.get(&role).cloned();
-        let mut out: Vec<(RoleEntry, bool)> =
-            live.unwrap_or_else(|| ctx.cfg.entries_for(role).to_vec()).into_iter().map(|e| (e, false)).collect();
+        let (live, rejected) = {
+            let g = self.inner.lock().unwrap();
+            (g.overrides.get(&role).cloned(), g.rejected.clone())
+        };
+        let mut out: Vec<(RoleEntry, bool)> = live
+            .unwrap_or_else(|| ctx.cfg.entries_for(role).to_vec())
+            .into_iter()
+            .filter(|e| e.model.as_ref().is_none_or(|m| !rejected.contains(&(e.backend, m.clone()))))
+            .map(|e| (e, false))
+            .collect();
         if ctx.cfg.policy.spillover {
             for k in BackendKind::ALL {
                 if !out.iter().any(|(e, _)| e.backend == k) {
@@ -190,10 +199,13 @@ impl Pool {
         loop {
             let cands = self.candidates(ctx, role);
             if cands.is_empty() {
-                return Err(crate::error::VdashError::new(
-                    4,
-                    format!("no available backend for role {role} (check [roles] and `vdash doctor`)"),
-                ));
+                let rejected = self.inner.lock().unwrap().rejected.iter().map(|(b, m)| format!("{b}:{m}")).collect::<Vec<_>>();
+                let why = if rejected.is_empty() {
+                    "check [roles] and `vdash doctor`".to_string()
+                } else {
+                    format!("rejected models: {}; choose another with `/model {role} …`", rejected.join(", "))
+                };
+                return Err(crate::error::VdashError::new(4, format!("no available backend for role {role} ({why})")));
             }
             // Pick under the lock.
             let picked = {
@@ -344,6 +356,20 @@ impl Pool {
                             }),
                         );
                     }
+                    continue;
+                }
+                Some(Failure::ModelUnavailable(why)) if entry.model.is_some() => {
+                    let model = entry.model.clone().unwrap_or_default();
+                    g.rejected.insert((entry.backend, model.clone()));
+                    drop(g);
+                    self.cv.notify_all();
+                    crate::models::mark_rejected(&ctx.models_cache, entry.backend, &model, why);
+                    events::emit(
+                        ctx,
+                        round,
+                        "note",
+                        json!({"text": format!("{}:{model} is unavailable ({why}); role {role} moves to its next entry for this run", entry.backend)}),
+                    );
                     continue;
                 }
                 Some(Failure::NotLoggedIn) => {
@@ -693,6 +719,34 @@ mod tests {
         t.join().unwrap();
         assert_eq!(e.code, 130);
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn rejected_model_moves_to_the_next_entry_without_pausing() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_with(&tmp, "\n[roles]\ncritic = [\"claude:fable\", \"claude:opus\"]\nworker = [\"claude:fable\"]\n");
+        let c = Arc::new(FakeBackend::new(BackendKind::Claude));
+        c.fail(Role::Critic, Failure::ModelUnavailable("Fable 5.2 requires usage credits.".into()));
+        c.always(Role::Critic, json!({}));
+        let pool = Pool::new(&ctx, vec![c.clone()]);
+        let s = pool.run(&ctx, 1, Role::Critic, &call(Role::Critic)).unwrap();
+        assert_eq!(s.result.failure, None);
+        assert_eq!(s.entry.model.as_deref(), Some("opus"));
+        let models: Vec<Option<String>> = c.calls.lock().unwrap().iter().map(|x| x.model.clone()).collect();
+        assert_eq!(models, vec![Some("fable".to_string()), Some("opus".to_string())]);
+        let h = &pool.health()[&BackendKind::Claude];
+        assert!(h.paused_until.is_none() && h.step == 0 && !h.unavailable, "a rejected model is not a usage limit: {h:?}");
+        assert!(paused_events(&ctx).is_empty());
+        // Recorded for the catalog, and never tried again in this run.
+        assert!(!crate::models::current(&ctx.models_cache).claude.contains(&"fable".to_string()));
+        pool.run(&ctx, 1, Role::Critic, &call(Role::Critic)).unwrap();
+        assert_eq!(c.count(Role::Critic), 3);
+        assert_eq!(c.calls.lock().unwrap().last().unwrap().model.as_deref(), Some("opus"));
+        // A role whose only entry was rejected stops with a message naming it.
+        let e = pool.run(&ctx, 1, Role::Worker, &call(Role::Worker)).err().expect("no entry left");
+        assert_eq!(e.code, 4);
+        assert!(e.message.contains("claude:fable"), "{}", e.message);
+        assert_eq!(c.count(Role::Worker), 0);
     }
 
     #[test]

@@ -75,6 +75,9 @@ pub enum Failure {
     Crash,
     Quota,
     NotLoggedIn,
+    /// The CLI rejected the model itself (unknown, or not on this plan: facts C17,
+    /// A19). Never a usage limit; the pool moves on to the role's next entry.
+    ModelUnavailable(String),
     AgentError(String),
 }
 
@@ -85,6 +88,7 @@ impl Failure {
             Failure::Crash => "crash".into(),
             Failure::Quota => "quota".into(),
             Failure::NotLoggedIn => "not_logged_in".into(),
+            Failure::ModelUnavailable(m) => format!("model_unavailable: {m}"),
             Failure::AgentError(m) => format!("agent_error: {m}"),
         }
     }

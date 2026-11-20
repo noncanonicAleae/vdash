@@ -45,6 +45,7 @@ fn m1_11_gate_all_thirteen_scenarios() {
         cfg,
         state_dir,
         exe: std::path::PathBuf::from(apc_bin),
+        models_cache: xdg_state.join("models.json"),
     };
 
     let sol_path = camp.solution_file();
@@ -424,6 +425,7 @@ fn gate_cache_reuses_unchanged_parallel_leanchecker_and_fresh_rebuilds() {
         cfg,
         state_dir: state_dir.clone(),
         exe: std::path::PathBuf::from(apc_bin),
+        models_cache: xdg_state.join("models.json"),
     };
 
     // Add two untrusted Proof modules imported by Solution.lean so parallel leanchecker runs.

@@ -23,6 +23,9 @@ pub struct Ctx {
     pub cfg: Config,
     pub state_dir: PathBuf,
     pub exe: PathBuf,
+    /// The user's model catalog cache (`models.json`, ROADMAP M8-08), shared by
+    /// every campaign.
+    pub models_cache: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -730,6 +733,7 @@ impl Ctx {
             cfg,
             state_dir: state_dir.as_ref().to_path_buf(),
             exe,
+            models_cache: state_dir.as_ref().join("models.json"),
         })
     }
 }

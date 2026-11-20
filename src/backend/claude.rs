@@ -136,7 +136,13 @@ pub fn parse(stdout: &str) -> AgentResult {
     }
     let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
     let status = v.get("api_error_status").and_then(Value::as_u64);
-    if matches!(status, Some(429) | Some(529)) || (is_error && looks_like_quota(&r.text)) {
+    let api_error = v.get("api_error").and_then(Value::as_str).unwrap_or("");
+    // Fact C17: an unknown model is a 404 and a model the plan does not include is
+    // a 429 with `api_error` `model_requires_usage_credits`; both are rejected
+    // before any inference. Any other 429 stays a usage limit.
+    if is_error && (status == Some(404) || api_error == "model_requires_usage_credits") {
+        r.failure = Some(Failure::ModelUnavailable(crate::util::clip(r.text.trim(), 200, false)));
+    } else if matches!(status, Some(429) | Some(529)) || (is_error && looks_like_quota(&r.text)) {
         r.failure = Some(Failure::Quota);
     } else if is_error && looks_like_not_logged_in(&r.text) {
         r.failure = Some(Failure::NotLoggedIn);
@@ -223,6 +229,17 @@ mod tests {
         assert_eq!(parse(l).failure, Some(Failure::NotLoggedIn));
         let e = r#"{"is_error":true,"subtype":"error_max_turns","result":"stopped"}"#;
         assert!(matches!(parse(e).failure, Some(Failure::AgentError(_))));
+    }
+
+    #[test]
+    fn a_rejected_model_is_not_a_usage_limit() {
+        // Fact C17, as printed on 2026-11-20.
+        let fable = r#"{"is_error":true,"subtype":"success","result":"Fable 5.2 requires usage credits. Switch to another model, or manage usage credits at https://claude.ai/settings/usage, to continue.","api_error_status":429,"api_error_code":"credits_required","api_error":"model_requires_usage_credits","total_cost_usd":0}"#;
+        assert!(matches!(parse(fable).failure, Some(Failure::ModelUnavailable(ref m)) if m.starts_with("Fable 5.2 requires usage credits")));
+        let unknown = r#"{"is_error":true,"subtype":"success","result":"There's an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it.","api_error_status":404,"api_error_code":null,"api_error":null}"#;
+        assert!(matches!(parse(unknown).failure, Some(Failure::ModelUnavailable(_))));
+        let limit = r#"{"is_error":true,"result":"You've hit your limit","api_error_status":429,"api_error_code":"rate_limit_error","api_error":null}"#;
+        assert_eq!(parse(limit).failure, Some(Failure::Quota));
     }
 
     #[test]

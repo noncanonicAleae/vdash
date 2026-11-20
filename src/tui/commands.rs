@@ -14,6 +14,8 @@ pub enum Cmd {
     Model(Option<(String, String)>),
     /// `/model default`: restore the built-in Claude/Gemini split for every role.
     ModelDefault,
+    /// `/model refresh`: reread `agy models` and recheck rejected models.
+    ModelRefresh,
     Login(Option<String>),
     Search(String),
     Btw(String),
@@ -50,7 +52,7 @@ pub enum Cmd {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("help", "", "list commands"),
     ("status", "", "campaign summary"),
-    ("model", "[default | <role|all> <backend>[:<model>][,<backend>[:<model>]] | <backend> <model>]", "show or change which backend and model serves each role"),
+    ("model", "[default | refresh | <role|all> <backend>[:<model>][,<backend>[:<model>]] | <backend> <model>]", "show or change which backend and model serves each role"),
     ("login", "[claude|gemini]", "sign in to your Claude or Gemini account"),
     ("search", "<query>", "search Mathlib, campaign Lean files, and online Loogle docs"),
     ("btw", "<question>", "ask the monitor a side question; work continues"),
@@ -93,40 +95,6 @@ pub const ROLES: &[&str] = &[
 ];
 
 pub const BACKENDS: &[&str] = &["claude", "gemini"];
-
-pub const CLAUDE_MODELS: &[&str] = &[
-    // Probed on the subscription 2026-11-14 (ROADMAP fact C12): each id answered, and
-    // the aliases resolve to the newest model of their family.
-    "opus",
-    "sonnet",
-    "haiku",
-    "fable",
-    "claude-opus-5-5",
-    "claude-sonnet-5-5",
-    "claude-haiku-5-5",
-    "claude-fable-5-2",
-];
-
-pub const GEMINI_MODELS: &[&str] = &[
-    "gemini-4-argon-high",
-    "gemini-4-argon-medium",
-    "gemini-4-argon-low",
-    "gemini-4-hydrogen-xhigh",
-    "gemini-4-hydrogen-high",
-    "gemini-4-hydrogen-medium",
-    "gemini-4-hydrogen-low",
-    "gemini-3.8-flash-high",
-    "gemini-3.8-flash-medium",
-    "gemini-3.8-flash-low",
-];
-
-pub fn models_for_backend(backend: &str) -> &'static [&'static str] {
-    match backend {
-        "claude" => CLAUDE_MODELS,
-        "gemini" => GEMINI_MODELS,
-        _ => &[],
-    }
-}
 
 fn usage(name: &str) -> String {
     let (n, a, _) = COMMANDS.iter().find(|(n, _, _)| *n == name).copied().unwrap_or((name, "", ""));
@@ -176,6 +144,7 @@ pub fn parse(line: &str) -> Result<Input, String> {
         "model" | "models" => match model_words(args).iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             [] | ["list"] => Ok(Cmd::Model(None)),
             ["default"] => Ok(Cmd::ModelDefault),
+            ["refresh"] => Ok(Cmd::ModelRefresh),
             [backend @ ("claude" | "gemini"), model] => {
                 let entry = if let Some(rest) = model.strip_prefix(&format!("{backend}:")) {
                     format!("{backend}:{rest}")
@@ -299,13 +268,14 @@ pub fn parse(line: &str) -> Result<Input, String> {
 }
 
 /// Completions for the text typed so far. Each is the full replacement line.
-pub fn complete(line: &str, agents: &[String]) -> Vec<String> {
+pub fn complete(line: &str, agents: &[String], models: &crate::models::Catalog) -> Vec<String> {
+    let models_for_backend = |b: &str| models.for_backend(b).to_vec();
     let Some(rest) = line.strip_prefix('/') else { return Vec::new() };
     let parts: Vec<&str> = rest.split(' ').collect();
     match parts.as_slice() {
         [prefix] => COMMANDS.iter().filter(|(n, _, _)| n.starts_with(prefix)).map(|(n, _, _)| format!("/{n}")).collect(),
         ["login", b] => BACKENDS.iter().filter(|x| x.starts_with(b)).map(|x| format!("/login {x}")).collect(),
-        ["model", role] => std::iter::once(&"default").chain(ROLES).filter(|r| r.starts_with(role)).map(|r| format!("/model {r}")).collect(),
+        ["model", role] => ["default", "refresh"].iter().chain(ROLES).filter(|r| r.starts_with(role)).map(|r| format!("/model {r}")).collect(),
         ["model", backend @ ("claude" | "gemini"), model_prefix] => models_for_backend(backend)
             .iter()
             .filter(|m| m.starts_with(model_prefix))
@@ -368,6 +338,7 @@ mod tests {
         assert_eq!(parse("/model").unwrap(), Input::Cmd(Cmd::Model(None)));
         assert_eq!(parse("/model list").unwrap(), Input::Cmd(Cmd::Model(None)));
         assert_eq!(parse("/model default").unwrap(), Input::Cmd(Cmd::ModelDefault));
+        assert_eq!(parse("/model refresh").unwrap(), Input::Cmd(Cmd::ModelRefresh));
         assert_eq!(parse("/model worker gemini:gemini-4-argon-high").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini:gemini-4-argon-high".into())))));
         assert_eq!(parse("/model worker gemini gemini-4-argon-high").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini:gemini-4-argon-high".into())))));
         assert_eq!(parse("/model worker gemini,claude:sonnet").unwrap(), Input::Cmd(Cmd::Model(Some(("worker".into(), "gemini,claude:sonnet".into())))));
@@ -393,7 +364,7 @@ mod tests {
 
     #[test]
     fn errors_name_the_usage_and_suggest() {
-        assert_eq!(parse("/model worker").unwrap_err(), "usage: /model [default | <role|all> <backend>[:<model>][,<backend>[:<model>]] | <backend> <model>]");
+        assert_eq!(parse("/model worker").unwrap_err(), "usage: /model [default | refresh | <role|all> <backend>[:<model>][,<backend>[:<model>]] | <backend> <model>]");
         assert!(parse("/model wrker claude").unwrap_err().contains("unknown role"));
         assert!(parse("/model worker gpt").unwrap_err().contains("unknown backend"));
         assert_eq!(parse("/btw").unwrap_err(), "usage: /btw <question>");
@@ -419,17 +390,26 @@ mod tests {
 
     #[test]
     fn completion() {
-        assert_eq!(complete("/st", &[]), vec!["/status", "/stop"]);
-        assert_eq!(complete("/model wo", &[]), vec!["/model worker"]);
-        assert_eq!(complete("/model de", &[]), vec!["/model default"]);
-        assert_eq!(complete("/model worker g", &[]), vec!["/model worker gemini", "/model worker gemini,claude"]);
-        assert_eq!(complete("/model worker gemini,c", &[]), vec!["/model worker gemini,claude"]);
-        assert_eq!(complete("/model claude g", &[]), Vec::<String>::new());
-        assert_eq!(complete("/model worker claude:o", &[]), vec!["/model worker claude:opus"]);
-        assert_eq!(complete("/model worker gemini gemini-3.8-flash-h", &[]), vec!["/model worker gemini gemini-3.8-flash-high"]);
-        assert_eq!(complete("/login c", &[]), vec!["/login claude"]);
-        assert_eq!(complete("/logs w", &["worker-1".into(), "critic-2".into()]), vec!["/logs worker-1"]);
-        assert!(complete("plain", &[]).is_empty());
+        let cat = crate::models::catalog(&crate::models::Cache::default(), 0);
+        assert_eq!(complete("/st", &[], &cat), vec!["/status", "/stop"]);
+        assert_eq!(complete("/model wo", &[], &cat), vec!["/model worker"]);
+        assert_eq!(complete("/model de", &[], &cat), vec!["/model default"]);
+        assert_eq!(complete("/model worker g", &[], &cat), vec!["/model worker gemini", "/model worker gemini,claude"]);
+        assert_eq!(complete("/model worker gemini,c", &[], &cat), vec!["/model worker gemini,claude"]);
+        assert_eq!(complete("/model claude g", &[], &cat), Vec::<String>::new());
+        assert_eq!(complete("/model worker claude:o", &[], &cat), vec!["/model worker claude:opus"]);
+        assert_eq!(complete("/model worker gemini gemini-3.8-flash-h", &[], &cat), vec!["/model worker gemini gemini-3.8-flash-high"]);
+        assert_eq!(complete("/login c", &[], &cat), vec!["/login claude"]);
+        assert_eq!(complete("/logs w", &["worker-1".into(), "critic-2".into()], &cat), vec!["/logs worker-1"]);
+        assert!(complete("plain", &[], &cat).is_empty());
+        assert_eq!(complete("/model r", &[], &cat), vec!["/model refresh", "/model reviewer"]);
+        // Model names come from the catalog: a live `agy models` list, minus rejected models.
+        let mut c = crate::models::Cache { gemini: vec!["gemini-4-neon-high".into(), "gemini-4-argon-high".into()], gemini_fetched: Some(1), ..Default::default() };
+        c.rejected.insert("claude:fable".into(), crate::models::Rejected { reason: "x".into(), at: 1 });
+        let live = crate::models::catalog(&c, 2);
+        assert_eq!(complete("/model worker gemini:gemini-4-n", &[], &live), vec!["/model worker gemini:gemini-4-neon-high"]);
+        assert_eq!(complete("/model claude f", &[], &live), Vec::<String>::new());
+        assert_eq!(complete("/model claude f", &[], &cat), vec!["/model claude fable"]);
         assert_eq!(describe("/gate"), "run the gatekeeper now");
     }
 }
